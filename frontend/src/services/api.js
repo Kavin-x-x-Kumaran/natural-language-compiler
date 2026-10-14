@@ -19,10 +19,10 @@ export class GenerationError extends Error {
  *
  * ANTICIPATED contract (frontend proposal, see README):
  *   POST {VITE_API_BASE_URL}/compile
- *   body { "nl_code": [{ "line": 1, "text": "..." }] }
+ *   body [{ "line": 1, "text": "..." }]
  *   2xx  { "output": "<string>" }
  *
- * @param {{ nl_code: Array<{line:number,text:string}> }} payload
+ * @param {Array<{line:number,text:string}>} payload
  * @param {{ signal?: AbortSignal }} options
  * @returns {Promise<string>} the backend's `output` string, used verbatim.
  */

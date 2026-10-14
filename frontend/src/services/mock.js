@@ -32,7 +32,7 @@ export async function mockGenerate(payload, { signal } = {}) {
     error.name = 'AbortError';
     throw error;
   }
-  const lines = (payload && payload.nl_code) || [];
+  const lines = Array.isArray(payload) ? payload : [];
   return `${MOCK_SOURCE}/* [mock] ${lines.length} natural-language line(s) received */\n`;
 }
 

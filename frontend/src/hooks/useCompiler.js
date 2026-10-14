@@ -137,15 +137,15 @@ export function useCompiler({ updateTab, tabsRef }) {
 
       const payload = buildPayload(tab.nlText);
 
-      if (payload.nl_code.length === 0) {
+      if (payload.length === 0) {
         append(tabId, 'error', 'Nothing to run. Write at least one line.');
         return 'rejected';
       }
-      if (payload.nl_code.length > MAX_LINES) {
+      if (payload.length > MAX_LINES) {
         append(
           tabId,
           'error',
-          `Too many lines: ${payload.nl_code.length}. The limit is ${MAX_LINES} non-empty lines.`
+          `Too many lines: ${payload.length}. The limit is ${MAX_LINES} non-empty lines.`
         );
         return 'rejected';
       }

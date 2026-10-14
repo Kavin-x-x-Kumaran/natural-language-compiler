@@ -54,13 +54,15 @@ real backend should mean editing only those three files.
 
 `POST {VITE_API_BASE_URL}/compile` with `Content-Type: application/json`.
 
-Request body (**this shape is decided**: the backend joins the lines and appends
+Request body: a top-level array (the backend joins the lines and appends
 them to `prefix.txt` before calling the model):
 
 ```json
-{ "nl_code": [ { "line": 1, "text": "Read 2 numbers as input" },
-               { "line": 2, "text": "Add them" },
-               { "line": 3, "text": "Display the answer" } ] }
+[
+   { "line": 1, "text": "Read 2 numbers as input" },
+   { "line": 2, "text": "Add them" },
+   { "line": 3, "text": "Display the answer" }
+]
 ```
 
 Anticipated responses:

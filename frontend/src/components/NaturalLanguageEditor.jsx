@@ -10,7 +10,7 @@ export default function NaturalLanguageEditor({
   generating,
   savedFlash,
 }) {
-  const lineCount = buildPayload(value).nl_code.length;
+  const lineCount = buildPayload(value).length;
 
   return (
     <section className="editor-section" aria-label="Natural language editor">
