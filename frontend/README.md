@@ -69,10 +69,10 @@ Anticipated responses:
 
 | case | shape | frontend behaviour |
 | --- | --- | --- |
-| 2xx | `{ "output": "<string>" }` | `output` is used verbatim |
-| `output` starts with `ERROR:` | e.g. `ERROR: INVALID_INPUT \| …` | shown as a terminal error; the C editor is **not** touched |
+| 2xx | `{ "code": "<string>" }` | `code` is used verbatim |
+| `code` starts with `ERROR:` | e.g. `ERROR: INVALID_INPUT \| …` | shown as a terminal error; the C editor is **not** touched |
 | non-2xx | `{ "error": "…" }` optional | `HTTP <status> — <error or statusText>` |
-| 2xx, not JSON or no string `output` | — | "Unexpected response format from backend." Nothing is guessed. |
+| 2xx, not JSON or no string `code` | — | "Unexpected response format from backend." Nothing is guessed. |
 | transport failure / timeout | — | "Could not reach the backend." / "The request timed out after 120 seconds." |
 
 ### Execution — WebSocket
@@ -173,7 +173,7 @@ Choices made where the specification left something open:
    `WS_CONNECT_TIMEOUT_MS = 10000`, `STOP_TIMEOUT_MS = 5000`,
    `MAX_TERMINAL_ENTRIES = 5000`, 10 tabs maximum.
 5. **Placeholder paths.** `/compile` and `/ws/run`.
-6. **`ERROR:` rule.** A 2xx `output` beginning with `ERROR:` is a rejection: it
+6. **`ERROR:` rule.** A 2xx `code` beginning with `ERROR:` is a rejection: it
    is shown as a terminal error and never reaches the C editor.
 7. **Connection status.** Derived only from real calls. Nothing is pinged on
    load (there is no health endpoint), so the chip starts grey.

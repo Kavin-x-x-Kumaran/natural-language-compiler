@@ -24,7 +24,7 @@ int main(void) {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Simulated generation. Resolves with the same `output` shape as the real adapter. */
+/** Simulated generation. Resolves with the code string returned by the real adapter. */
 export async function mockGenerate(payload, { signal } = {}) {
   await delay(1000);
   if (signal && signal.aborted) {

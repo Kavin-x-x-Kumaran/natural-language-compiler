@@ -20,11 +20,11 @@ export class GenerationError extends Error {
  * ANTICIPATED contract (frontend proposal, see README):
  *   POST {VITE_API_BASE_URL}/compile
  *   body [{ "line": 1, "text": "..." }]
- *   2xx  { "output": "<string>" }
+ *   2xx  { "code": "<string>" }
  *
  * @param {Array<{line:number,text:string}>} payload
  * @param {{ signal?: AbortSignal }} options
- * @returns {Promise<string>} the backend's `output` string, used verbatim.
+ * @returns {Promise<string>} the backend's `code` string, used verbatim.
  */
 export async function generateCode(payload, { signal } = {}) {
   if (MOCK_ENABLED) return mockGenerate(payload, { signal });
@@ -88,9 +88,9 @@ export async function generateCode(payload, { signal } = {}) {
     throw new GenerationError('Unexpected response format from backend.');
   }
 
-  if (!body || typeof body.output !== 'string') {
+  if (!body || typeof body.code !== 'string') {
     throw new GenerationError('Unexpected response format from backend.');
   }
 
-  return body.output;
+  return body.code;
 }
