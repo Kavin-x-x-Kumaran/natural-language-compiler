@@ -5,8 +5,10 @@ from pathlib import Path
 import httpx
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from compiler import MAX_SOURCE_BYTES, Execution, compile_source
@@ -32,7 +34,22 @@ class NLLine(BaseModel):
     text: str
 
 
+class CompileRequest(BaseModel):
+    """Body the frontend sends: {"nl_code": [{"line": 1, "text": "..."}]}."""
+
+    nl_code: list[NLLine]
+
+
 app = FastAPI()
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(_: Request, exc: RequestValidationError) -> JSONResponse:
+    # The frontend reads `error` from failure bodies; FastAPI's default is `detail`.
+    return JSONResponse(
+        status_code=422,
+        content={"error": "Request body must be {\"nl_code\": [{\"line\": int, \"text\": str}]}."},
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,7 +60,8 @@ app.add_middleware(
 
 
 @app.post(COMPILE_ROUTE)
-async def compile_nl(lines: list[NLLine]):
+async def compile_nl(request: CompileRequest):
+    lines = request.nl_code
     nl_code = "\n".join(f"{l.line}. {l.text}" for l in sorted(lines, key=lambda l: l.line))
     payload = {
         "model": MODEL,
@@ -59,11 +77,13 @@ async def compile_nl(lines: list[NLLine]):
             content = response.json()["choices"][0]["message"]["content"]
     except Exception as e:
         print(f"llama.cpp request failed: {e!r}")
-        raise HTTPException(status_code=500, detail="llama.cpp server is down")
+        return JSONResponse(status_code=500, content={"error": "llama.cpp server is down"})
 
     # Placeholder: display the generated output.
     print(content)
-    return {"code": content}
+    # `output` is passed through verbatim; the frontend treats a value starting
+    # with "ERROR:" (prefix.txt's rejection format) as an error, not as code.
+    return {"output": content}
 
 
 @app.websocket(WS_RUN_ROUTE)
