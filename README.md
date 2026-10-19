@@ -52,3 +52,10 @@ untrusted C safely needs OS-level isolation — a container with a seccomp
 profile, no network namespace, and an unprivileged user. Deploy it behind
 that; `prefix.txt` asking the model to refuse unsafe programs is not a
 security boundary.
+
+## Repository layout
+
+| path | contents |
+| --- | --- |
+| `frontend/` | React + Vite web UI — see [`frontend/README.md`](frontend/README.md) |
+| `backend/` | FastAPI generation service — see [`backend/README.md`](backend/README.md) |
