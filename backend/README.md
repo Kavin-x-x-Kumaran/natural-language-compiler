@@ -6,7 +6,16 @@ The backend does not download or start the model server. The `llama.cpp` server 
 
 ## Setup
 
-### 1. Install dependencies
+### 1. Install gcc
+
+The backend compiles generated C with gcc. It runs on Linux, macOS and Windows.
+
+- **Linux / macOS:** install gcc with your package manager, such as `sudo apt install gcc` on Ubuntu.
+- **Windows:** install MinGW-w64, for example through [MSYS2](https://www.msys2.org/) with `pacman -S mingw-w64-ucrt-x86_64-gcc`. Add its `bin` folder (such as `C:\msys64\ucrt64\bin`) to `PATH`, or set `NLC_GCC` to the full path of `gcc.exe`.
+
+Check the installation with `gcc --version` in a new terminal. If gcc is missing, Compile & Run reports how to install it.
+
+### 2. Install dependencies
 
 From the repository root, install the Python dependencies:
 
@@ -14,7 +23,7 @@ From the repository root, install the Python dependencies:
 pip install -r requirements.txt
 ```
 
-### 2. Configure environment variables
+### 3. Configure environment variables
 
 Create `backend/.env` with the following configuration:
 
@@ -26,7 +35,7 @@ LLAMA_PORT=8080
 
 These values configure the HTTP generation endpoint, the FastAPI server port, and the local `llama.cpp` server port, respectively.
 
-### 3. Start the model server
+### 4. Start the model server
 
 Start a `llama.cpp` server separately, exposing its OpenAI-compatible chat completions endpoint at:
 
@@ -36,7 +45,7 @@ http://127.0.0.1:8080/v1/chat/completions
 
 The server should serve the model `Qwen3-4B-Q4_K_M.gguf`.
 
-### 4. Start the backend
+### 5. Start the backend
 
 From the repository root, run:
 
@@ -55,8 +64,11 @@ If you change `SERVER_PORT` or `LLAMA_PORT`, ensure that the frontend's API base
 | `COMPILE_ROUTE` | Yes | HTTP path for the code-generation endpoint, such as `/compile`. |
 | `SERVER_PORT` | Yes | Port used by the FastAPI server. |
 | `LLAMA_PORT` | Yes | Port used by the local `llama.cpp` server. |
+| `WS_RUN_ROUTE` | No | WebSocket path for compiling and running C. Defaults to `/ws/run`. |
+| `NLC_GCC` | No | Full path to gcc, such as `C:\msys64\ucrt64\bin\gcc.exe`. Defaults to `gcc` on `PATH`. |
+| `NLC_EXEC_MODE` | No | `pty` (default on Linux and macOS) or `pipe` (always used on Windows). Set `pipe` on Linux to test the Windows execution path. |
 
-The variables are loaded from `backend/.env` or the process environment. All three must be configured; the application does not provide code-level defaults for them.
+The variables are loaded from `backend/.env` or the process environment. The first three must be configured; the application does not provide code-level defaults for them.
 
 The model name, temperature (`0.1`), and request prompt are configured in `main.py`.
 
@@ -163,15 +175,16 @@ Example messages:
 
 #### Interactive input handling
 
-Programs run on a pseudo-terminal (PTY). This allows unflushed prompts, such as:
+Unflushed prompts, such as:
 
 ```c
 printf("Enter a number: ");
 ```
 
-to reach the client before the program blocks waiting for input.
+reach the client before the program blocks waiting for input. How this works depends on the platform:
 
-The backend detects when a process is actually blocked reading standard input using `/proc/<pid>/syscall`. It sends `input_required` when the process is waiting for input, rather than incorrectly treating a busy-running program as an interactive prompt.
+- **Linux and macOS:** programs run on a pseudo-terminal (PTY). On Linux, the backend detects when a process is actually blocked reading standard input using `/proc/<pid>/syscall`, so a busy-running program is not treated as an interactive prompt.
+- **Windows:** there are no PTYs, so programs run on pipes. The backend links a small runtime shim into every build that turns off stdout buffering and stops `\n` from being written as `\r\n`. `input_required` is inferred: the program is running, has printed nothing for 0.25 seconds, and is not using CPU. A program that pauses with `Sleep()` without reading input can therefore briefly unlock the input box.
 
 #### Compiler diagnostics
 
@@ -183,13 +196,19 @@ program.c:4:5: error: ...
 
 #### Compilation flags
 
-GCC uses the following flags:
+GCC uses the following flags on Linux and macOS:
 
 ```text
 -std=c11 -O1 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2
 ```
 
-The executable is linked with `-lm` for mathematical functions.
+On Windows (MinGW-w64):
+
+```text
+-std=c11 -O1 -Wall -Wextra -static
+```
+
+`-static` means the program needs no MinGW DLLs at run time. The hardening flags are omitted on Windows because many MinGW builds need an extra library for them. The executable is linked with `-lm` for mathematical functions.
 
 ## Execution limits
 
@@ -198,13 +217,14 @@ The execution service applies the following resource limits:
 | Limit | Value |
 | --- | --- |
 | GCC wall-clock time | 20 seconds |
-| Program CPU time | 5 seconds (`RLIMIT_CPU`) |
+| Program CPU time | 5 seconds (`RLIMIT_CPU`; on Windows, polled CPU time with a Job Object backstop) |
 | Program wall-clock time | 60 seconds |
-| Address space | 256 MB |
-| File writes | 8 MB (`RLIMIT_FSIZE`) |
+| Memory | 256 MB (`RLIMIT_AS`; Job Object on Windows) |
+| File writes | 8 MB (`RLIMIT_FSIZE`; not limited on Windows) |
+| Child processes | 64 per user on Linux; none allowed on Windows (Job Object) |
 | Total streamed output | 1 MB; exceeding the limit kills the program |
 | Maximum accepted source size | 256 KB |
-| Stop escalation | `SIGTERM` to the process group, followed by `SIGKILL` after 2 seconds |
+| Stop escalation | `SIGTERM` to the process group, followed by `SIGKILL` after 2 seconds; immediate termination on Windows |
 
 Each execution uses a private temporary directory and a scrubbed environment. The temporary directory is removed when the WebSocket connection closes.
 
@@ -243,6 +263,7 @@ CORS currently allows requests from any origin. This configuration is intended f
 - Code generation requires a separately running `llama.cpp` server with the configured model available.
 - Generation has no request timeout.
 - Generated C is compiled and executed through the WebSocket endpoint, subject to the documented resource limits.
+- Windows enforces fewer limits than Linux: there is no file-size limit, and a program runs for a moment before its memory, CPU and child-process limits apply.
 - The execution service is not a complete security sandbox. Additional OS-level isolation is required before running untrusted programs.
 - The current CORS configuration permits requests from any origin and is intended only for local development.
 

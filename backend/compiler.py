@@ -6,31 +6,60 @@ WebSockets. It exposes two things to the app layer:
     compile_source(source)  -> CompileResult      (writes + invokes gcc)
     Execution(exe, workdir) -> async event stream (runs the binary)
 
+There are two execution backends behind `Execution`:
+
+    pty  (Linux, macOS)  The program runs on a pseudo-terminal under rlimits.
+                         "Waiting for input" is read from /proc on Linux.
+    pipe (Windows)       The program runs on plain pipes inside a Windows Job
+                         Object. A tiny runtime shim, linked into every build,
+                         turns off stdout buffering so prompts still arrive
+                         before the program blocks. "Waiting for input" is
+                         inferred: no output and no CPU use for a moment.
+
+Set NLC_EXEC_MODE=pipe to use the pipe backend on Linux (for testing it).
+
 SECURITY NOTE
 -------------
-The limits applied here (rlimits, timeouts, a scrubbed environment, a private
-working directory) are defence in depth, NOT a sandbox. A hostile program can
-still read world-readable files and open sockets. Running untrusted C safely
-needs OS-level isolation -- a container with a seccomp profile, a dropped
-network namespace and a non-privileged user. Deploy this behind that.
+The limits applied here (rlimits or a Job Object, timeouts, a scrubbed
+environment, a private working directory) are defence in depth, NOT a sandbox.
+A hostile program can still read files the server's user can read and open
+network connections. Running untrusted C safely needs OS-level isolation -- a
+container or VM with no network and an unprivileged user. Deploy this behind
+that.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import os
-import pty
-import resource
 import shutil
 import signal
-import termios
+import subprocess
+import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import mkdtemp
 
+IS_WINDOWS = sys.platform == "win32"
+
+if not IS_WINDOWS:
+    # POSIX only. Windows has none of these; the pipe backend replaces them.
+    import pty
+    import resource
+    import termios
+
+EXEC_MODE = os.environ.get("NLC_EXEC_MODE") or ("pipe" if IS_WINDOWS else "pty")
+if EXEC_MODE not in ("pty", "pipe") or (IS_WINDOWS and EXEC_MODE == "pty"):
+    raise RuntimeError(f"Unsupported NLC_EXEC_MODE={EXEC_MODE!r} on {sys.platform}")
+
 # --- knobs ----------------------------------------------------------------
 
-GCC = shutil.which("gcc") or "gcc"
+# NLC_GCC points at a specific compiler, e.g. C:\msys64\ucrt64\bin\gcc.exe
+# when MinGW's gcc is not on PATH.
+GCC = os.environ.get("NLC_GCC") or shutil.which("gcc") or "gcc"
 
 COMPILE_TIMEOUT_S = 20.0        # wall clock for gcc itself
 RUN_WALL_TIMEOUT_S = 60.0       # wall clock for the compiled program
@@ -43,20 +72,45 @@ STOP_GRACE_S = 2.0              # SIGTERM -> SIGKILL window
 
 # How long the program must sit idle before we decide it wants input.
 IDLE_PROBE_S = 0.12
+# Pipe backend only: quiet time before a blocked, non-busy program counts as
+# waiting for input, and the CPU use per probe that counts as "busy".
+PIPE_IDLE_PROMPT_S = 0.25
+PIPE_BUSY_CPU_S = 0.02
 
-GCC_FLAGS = [
-    "-std=c11",
-    "-O1",
-    "-pipe",
-    "-Wall",
-    "-Wextra",
-    "-fstack-protector-strong",
-    "-D_FORTIFY_SOURCE=2",
-]
+GCC_FLAGS = ["-std=c11", "-O1", "-pipe", "-Wall", "-Wextra"]
+if IS_WINDOWS:
+    # MinGW: link statically so the program needs no MinGW DLLs on PATH. The
+    # hardening flags below need libssp on many MinGW builds, so they are
+    # Linux/macOS only.
+    GCC_FLAGS += ["-static"]
+else:
+    GCC_FLAGS += ["-fstack-protector-strong", "-D_FORTIFY_SOURCE=2"]
 LINK_FLAGS = ["-lm"]
 
 SOURCE_NAME = "program.c"
-BINARY_NAME = "program"
+BINARY_NAME = "program.exe" if IS_WINDOWS else "program"
+RUNTIME_SHIM_NAME = "nlc_runtime.c"
+
+# Linked into pipe-mode builds only. Unbuffered stdout makes an unflushed
+# prompt like printf("Enter a number: ") reach the user before the program
+# blocks on input; on Windows, binary mode stops the CRT turning \n into \r\n.
+RUNTIME_SHIM = r"""/* Added by the backend; not part of the generated program. */
+#include <stdio.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
+__attribute__((constructor)) static void nlc_runtime_init(void)
+{
+#ifdef _WIN32
+    _setmode(0, _O_BINARY);
+    _setmode(1, _O_BINARY);
+    _setmode(2, _O_BINARY);
+#endif
+    setvbuf(stdout, NULL, _IONBF, 0);
+}
+"""
 
 
 @dataclass
@@ -84,6 +138,15 @@ def _apply_limits() -> None:
 
 def _child_env(workdir: Path) -> dict[str, str]:
     """A scrubbed environment: the program sees nothing of the server's."""
+    if IS_WINDOWS:
+        system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+        return {
+            # Windows processes need SYSTEMROOT to initialise.
+            "SYSTEMROOT": system_root,
+            "PATH": os.path.join(system_root, "System32"),
+            "TEMP": str(workdir),
+            "TMP": str(workdir),
+        }
     return {
         "PATH": "/usr/bin:/bin",
         "HOME": str(workdir),
@@ -91,6 +154,12 @@ def _child_env(workdir: Path) -> dict[str, str]:
         "LANG": "C.UTF-8",
         "TERM": "dumb",
     }
+
+
+def _gcc_env(workdir: Path) -> dict[str, str]:
+    # MinGW's gcc finds its assembler, linker and DLLs through PATH, so on
+    # Windows it gets the server's environment. gcc itself is trusted.
+    return dict(os.environ) if IS_WINDOWS else _child_env(workdir)
 
 
 # --- compilation ----------------------------------------------------------
@@ -102,40 +171,56 @@ async def compile_source(source: str) -> CompileResult:
     src_path = workdir / SOURCE_NAME
     exe_path = workdir / BINARY_NAME
 
-    src_path.write_text(source, encoding="utf-8")
+    # newline="\n": gcc reports the same line numbers either way, but keep the
+    # file byte-identical to what the user wrote on every platform.
+    src_path.write_text(source, encoding="utf-8", newline="\n")
 
-    argv = [GCC, *GCC_FLAGS, str(src_path), "-o", str(exe_path), *LINK_FLAGS]
+    sources = [SOURCE_NAME]
+    if EXEC_MODE == "pipe":
+        (workdir / RUNTIME_SHIM_NAME).write_text(RUNTIME_SHIM, encoding="utf-8", newline="\n")
+        sources.append(RUNTIME_SHIM_NAME)
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
+    # Relative paths, run from workdir: diagnostics then read
+    # "program.c:4:5: ..." with no server path to strip.
+    argv = [GCC, *GCC_FLAGS, *sources, "-o", BINARY_NAME, *LINK_FLAGS]
+
+    # subprocess in a worker thread rather than asyncio's subprocess support:
+    # the latter is unavailable on some Windows event loops.
+    def build() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            argv,
             cwd=workdir,
-            env=_child_env(workdir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            env=_gcc_env(workdir),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=COMPILE_TIMEOUT_S,
         )
-    except OSError as exc:
-        return CompileResult(False, f"could not start gcc: {exc}", None, workdir, -1)
 
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=COMPILE_TIMEOUT_S)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        result = await asyncio.to_thread(build)
+    except subprocess.TimeoutExpired:
         return CompileResult(
-            False,
-            f"gcc timed out after {COMPILE_TIMEOUT_S:.0f}s.",
-            None,
-            workdir,
-            -1,
+            False, f"gcc timed out after {COMPILE_TIMEOUT_S:.0f}s.", None, workdir, -1
         )
+    except FileNotFoundError:
+        hint = (
+            "Install MinGW-w64 (for example via MSYS2) and add its bin folder to PATH, "
+            "or set NLC_GCC to the full path of gcc.exe."
+            if IS_WINDOWS
+            else "Install gcc (for example: sudo apt install gcc), or set NLC_GCC to its path."
+        )
+        return CompileResult(False, f"gcc was not found at {GCC!r}. {hint}\n", None, workdir, -1)
+    except OSError as exc:
+        return CompileResult(False, f"could not start gcc: {exc}\n", None, workdir, -1)
 
-    diagnostics = out.decode("utf-8", "replace")
-    ok = proc.returncode == 0 and exe_path.exists()
-    # Strip the temp path so the user sees "program.c:4:5: error: ..."
-    diagnostics = diagnostics.replace(f"{workdir}/", "").replace(str(workdir), "")
+    diagnostics = result.stdout.decode("utf-8", "replace")
+    ok = result.returncode == 0 and exe_path.exists()
+    # Belt and braces: gcc may still print absolute paths (e.g. for headers).
+    for prefix in (f"{workdir}{os.sep}", f"{workdir}/", str(workdir)):
+        diagnostics = diagnostics.replace(prefix, "")
 
-    return CompileResult(ok, diagnostics, exe_path if ok else None, workdir, proc.returncode or 0)
+    return CompileResult(ok, diagnostics, exe_path if ok else None, workdir, result.returncode or 0)
 
 
 # --- execution ------------------------------------------------------------
@@ -165,7 +250,7 @@ def _waiting_for_stdin(pid: int) -> bool:
     return syscall_nr == 0 and fd == 0
 
 
-class Execution:
+class _PtyExecution:
     """Runs a compiled binary on a pty and reports what it does.
 
     A pty (rather than a pipe) matters: C's stdout is fully buffered when it
@@ -400,3 +485,396 @@ class Execution:
                 }
             )
             self._signal_group(signal.SIGKILL)
+
+
+# --- pipe backend (Windows; NLC_EXEC_MODE=pipe elsewhere) --------------------
+
+
+# Windows Job Object limits. Field types are spelled out with fixed-width
+# ctypes so the layout matches the Windows x64 ABI on any host (and can be
+# checked on Linux).
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        (name, ctypes.c_uint64)
+        for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+        )
+    ]
+
+
+class _JobBasicLimits(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),   # LARGE_INTEGER, 100 ns units
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),               # DWORD
+        ("MinimumWorkingSetSize", ctypes.c_size_t),    # SIZE_T
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),                 # ULONG_PTR
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _JobExtendedLimits(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobBasicLimits),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_LIMIT_PROCESS_TIME = 0x0002
+_JOB_LIMIT_ACTIVE_PROCESS = 0x0008
+_JOB_LIMIT_PROCESS_MEMORY = 0x0100
+_JOB_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x0400   # no "stopped working" dialog
+_JOB_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+# Common NTSTATUS exit codes for a crashed Windows program.
+_NTSTATUS_NAMES = {
+    0xC0000005: "access violation (invalid memory access)",
+    0xC0000094: "integer division by zero",
+    0xC00000FD: "stack overflow",
+    0xC0000409: "stack buffer overrun",
+    0xC000001D: "illegal instruction",
+    0xC0000017: "out of memory",
+}
+
+
+class _WindowsJob:
+    """A Job Object holding the program: memory, CPU time and process-count
+    limits, and the guarantee that closing the job kills the program."""
+
+    def __init__(self, handle: int) -> None:
+        self._handle = handle
+
+    @classmethod
+    def wrap(cls, proc: subprocess.Popen) -> "_WindowsJob | None":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        kernel32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+        ]
+        kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            return None
+
+        info = _JobExtendedLimits()
+        basic = info.BasicLimitInformation
+        basic.LimitFlags = (
+            _JOB_LIMIT_PROCESS_TIME
+            | _JOB_LIMIT_ACTIVE_PROCESS
+            | _JOB_LIMIT_PROCESS_MEMORY
+            | _JOB_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+            | _JOB_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        # Backstop only: the watcher in _PipeExecution stops the program at
+        # RUN_CPU_SECONDS with a clear message; this fires a little later.
+        basic.PerProcessUserTimeLimit = int((RUN_CPU_SECONDS + 2) * 10_000_000)
+        basic.ActiveProcessLimit = 1          # the program may not start others
+        info.ProcessMemoryLimit = MEMORY_BYTES
+
+        ok = kernel32.SetInformationJobObject(
+            handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(info), ctypes.sizeof(info),
+        ) and kernel32.AssignProcessToJobObject(handle, int(proc._handle))
+        if not ok:
+            kernel32.CloseHandle(handle)
+            return None
+        return cls(handle)
+
+    def kill(self) -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.TerminateJobObject(self._handle, 1)
+
+    def close(self) -> None:
+        if self._handle:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle(self._handle)   # KILL_ON_JOB_CLOSE ends the program
+            self._handle = 0
+
+
+def _cpu_seconds(proc: subprocess.Popen) -> float | None:
+    """CPU time (user + kernel) the process has used so far, or None."""
+    if IS_WINDOWS:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p] + [ctypes.c_void_p] * 4
+        created, exited, kernel, user = (ctypes.c_uint64() for _ in range(4))
+        if not kernel32.GetProcessTimes(
+            int(proc._handle), ctypes.byref(created), ctypes.byref(exited),
+            ctypes.byref(kernel), ctypes.byref(user),
+        ):
+            return None
+        return (kernel.value + user.value) / 10_000_000   # 100 ns units
+    try:
+        with open(f"/proc/{proc.pid}/stat", "r", encoding="ascii") as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+class _PipeExecution:
+    """Runs a compiled binary on pipes and reports what it does.
+
+    Same events and methods as _PtyExecution. Differences, all forced by
+    Windows having no ptys, rlimits or /proc:
+
+    - stdout is unbuffered by RUNTIME_SHIM rather than by a terminal;
+    - "waiting for input" is inferred: the program is alive, has printed
+      nothing for PIPE_IDLE_PROMPT_S, and is not using CPU. A program that
+      sleeps without reading input can therefore look like it wants input;
+    - limits come from a Job Object on Windows (rlimits elsewhere), and the CPU
+      limit is also enforced by polling, so it holds even if the job fails;
+    - stop terminates the program at once (Windows has no SIGTERM).
+
+    Output is read by one thread per stream and handed to the event loop, so
+    this works on any asyncio loop.
+    """
+
+    def __init__(self, exe_path: Path, workdir: Path) -> None:
+        self.exe_path = exe_path
+        self.workdir = workdir
+        self.events: asyncio.Queue[dict] = asyncio.Queue()
+
+        self._proc: subprocess.Popen | None = None
+        self._job: _WindowsJob | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._tasks: list[asyncio.Task] = []
+        self._streams_open = 0
+        self._streams_closed = asyncio.Event()
+        self._finished = asyncio.Event()
+        self._last_activity = time.monotonic()
+        self._prompted = False
+        self._bytes_out = 0
+        self._capped = False
+        self._stop_reason: str | None = None
+
+    # -- lifecycle --
+
+    async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        kwargs: dict = dict(
+            cwd=self.workdir,
+            env=_child_env(self.workdir),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        if IS_WINDOWS:
+            kwargs["creationflags"] = (
+                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            kwargs["preexec_fn"] = _apply_limits
+            kwargs["start_new_session"] = True
+
+        self._proc = subprocess.Popen([str(self.exe_path)], **kwargs)
+        if IS_WINDOWS:
+            # The program runs for a moment before it joins the job; Popen
+            # cannot start it suspended. Acceptable for these limits.
+            self._job = _WindowsJob.wrap(self._proc)
+            if self._job is None:
+                await self._emit({
+                    "type": "stderr",
+                    "data": "[warning: could not apply memory/CPU limits; time limit still applies]\n",
+                })
+
+        self._last_activity = time.monotonic()
+        for stream, kind in ((self._proc.stdout, "stdout"), (self._proc.stderr, "stderr")):
+            self._streams_open += 1
+            threading.Thread(target=self._read_stream, args=(stream, kind), daemon=True).start()
+
+        self._tasks = [
+            asyncio.create_task(self._wait_for_exit()),
+            asyncio.create_task(self._watch()),
+        ]
+
+    async def send_input(self, data: str) -> None:
+        proc = self._proc
+        if proc is None or proc.poll() is not None or proc.stdin is None:
+            return
+        self._prompted = False
+        self._last_activity = time.monotonic()
+        payload = data.encode("utf-8", "replace")
+
+        def write() -> None:
+            view = memoryview(payload)
+            while view:
+                written = proc.stdin.write(view)
+                view = view[written or 0:]
+
+        try:
+            await asyncio.to_thread(write)
+        except (OSError, ValueError):
+            pass  # program closed stdin or already gone
+
+    async def stop(self) -> None:
+        if self._proc is None or self._proc.poll() is not None:
+            return
+        self._kill()
+        try:
+            await asyncio.wait_for(self._finished.wait(), timeout=STOP_GRACE_S)
+        except asyncio.TimeoutError:
+            pass
+
+    async def close(self) -> None:
+        """Release everything. Safe to call more than once."""
+        if self._proc is not None and self._proc.poll() is None:
+            self._kill()
+            try:
+                await asyncio.wait_for(asyncio.to_thread(self._proc.wait), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+
+        for task in self._tasks:
+            task.cancel()
+        self._tasks.clear()
+
+        if self._proc is not None:
+            for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except OSError:
+                    pass
+        if self._job is not None:
+            self._job.close()
+            self._job = None
+
+        # Windows can hold the .exe open for a moment after the process dies.
+        for _ in range(10):
+            shutil.rmtree(self.workdir, ignore_errors=True)
+            if not self.workdir.exists():
+                break
+            await asyncio.sleep(0.1)
+
+    # -- internals --
+
+    def _kill(self) -> None:
+        if self._job is not None:
+            self._job.kill()
+        elif self._proc is not None:
+            if not IS_WINDOWS:
+                try:
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+                    return
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            try:
+                self._proc.kill()
+            except OSError:
+                pass
+
+    def _read_stream(self, stream, kind: str) -> None:
+        """Worker thread: forward chunks to the event loop as they arrive."""
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                self._call_soon(self._on_output, kind, chunk)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._call_soon(self._on_stream_closed)
+
+    def _call_soon(self, callback, *args) -> None:
+        try:
+            self._loop.call_soon_threadsafe(callback, *args)
+        except RuntimeError:
+            pass  # loop already closed; nothing is listening
+
+    def _on_output(self, kind: str, chunk: bytes) -> None:
+        self._last_activity = time.monotonic()
+        self._prompted = False
+        if self._capped:
+            return
+        self._bytes_out += len(chunk)
+        if self._bytes_out > MAX_OUTPUT_BYTES:
+            self._capped = True
+            self.events.put_nowait({
+                "type": "error",
+                "message": f"Output exceeded {MAX_OUTPUT_BYTES // 1024} KB; the program was stopped.",
+            })
+            self._kill()
+            return
+        self.events.put_nowait({"type": kind, "data": chunk.decode("utf-8", "replace")})
+
+    def _on_stream_closed(self) -> None:
+        self._streams_open -= 1
+        if self._streams_open <= 0:
+            self._streams_closed.set()
+
+    async def _emit(self, event: dict) -> None:
+        await self.events.put(event)
+
+    async def _watch(self) -> None:
+        """Detect input waits, and enforce CPU and wall-clock limits."""
+        started = time.monotonic()
+        last_cpu = _cpu_seconds(self._proc)
+        while self._proc.poll() is None:
+            await asyncio.sleep(IDLE_PROBE_S)
+            if self._proc.poll() is not None:
+                return
+
+            cpu = _cpu_seconds(self._proc)
+            busy = cpu is not None and last_cpu is not None and cpu - last_cpu > PIPE_BUSY_CPU_S
+            last_cpu = cpu if cpu is not None else last_cpu
+
+            if cpu is not None and cpu > RUN_CPU_SECONDS:
+                self._stop_reason = f"The program used more than {RUN_CPU_SECONDS}s of CPU time and was stopped."
+                self._kill()
+                return
+            if time.monotonic() - started > RUN_WALL_TIMEOUT_S:
+                self._stop_reason = f"The program ran longer than {RUN_WALL_TIMEOUT_S:.0f}s and was stopped."
+                self._kill()
+                return
+
+            quiet = time.monotonic() - self._last_activity >= PIPE_IDLE_PROMPT_S
+            if quiet and not busy and not self._prompted:
+                self._prompted = True
+                await self._emit({"type": "input_required"})
+
+    async def _wait_for_exit(self) -> None:
+        code = await asyncio.to_thread(self._proc.wait)
+        self._finished.set()
+
+        # Let the reader threads hand over whatever output is still in flight.
+        try:
+            await asyncio.wait_for(self._streams_closed.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+
+        if self._stop_reason:
+            await self._emit({"type": "error", "message": self._stop_reason})
+
+        if IS_WINDOWS:
+            status = code & 0xFFFFFFFF
+            if status in _NTSTATUS_NAMES:
+                await self._emit({
+                    "type": "stderr",
+                    "data": f"\n[program crashed: {_NTSTATUS_NAMES[status]} (0x{status:08X})]\n",
+                })
+        elif code < 0:
+            sig = -code
+            name = signal.Signals(sig).name if sig in set(signal.Signals) else str(sig)
+            await self._emit({"type": "stderr", "data": f"\n[program terminated by {name}]\n"})
+            code = 128 + sig
+
+        await self._emit({"type": "exit", "code": code, "phase": "run"})
+
+
+Execution = _PipeExecution if EXEC_MODE == "pipe" else _PtyExecution
