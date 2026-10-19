@@ -57,12 +57,35 @@ if EXEC_MODE not in ("pty", "pipe") or (IS_WINDOWS and EXEC_MODE == "pty"):
 
 # --- knobs ----------------------------------------------------------------
 
-# NLC_GCC points at a specific compiler, e.g. C:\msys64\ucrt64\bin\gcc.exe
-# when MinGW's gcc is not on PATH.
-GCC = os.environ.get("NLC_GCC") or shutil.which("gcc") or "gcc"
+# Where gcc lives, in this order: NLC_GCC, PATH, then (on Windows) the folders
+# MSYS2 and MinGW install to, so a fresh MSYS2 install works without PATH edits.
+_WINDOWS_GCC_GUESSES = (
+    r"C:\msys64\ucrt64\bin\gcc.exe",
+    r"C:\msys64\mingw64\bin\gcc.exe",
+    r"C:\mingw64\bin\gcc.exe",
+    r"C:\MinGW\bin\gcc.exe",
+)
+
+
+def _find_gcc() -> str:
+    explicit = os.environ.get("NLC_GCC")
+    if explicit:
+        return explicit
+    on_path = shutil.which("gcc")
+    if on_path:
+        return on_path
+    if IS_WINDOWS:
+        for guess in _WINDOWS_GCC_GUESSES:
+            if os.path.isfile(guess):
+                return guess
+    return "gcc"
+
+
+GCC = _find_gcc()
 
 COMPILE_TIMEOUT_S = 20.0        # wall clock for gcc itself
-RUN_WALL_TIMEOUT_S = 60.0       # wall clock for the compiled program
+RUN_WALL_TIMEOUT_S = 60.0       # running time; time spent waiting for input is not counted
+RUN_SESSION_LIMIT_S = 900.0     # absolute cap, input waits included, so nothing runs forever
 RUN_CPU_SECONDS = 5             # RLIMIT_CPU, SIGKILL on overrun
 MEMORY_BYTES = 256 * 1024 * 1024
 FSIZE_BYTES = 8 * 1024 * 1024   # largest file the program may write
@@ -77,7 +100,9 @@ IDLE_PROBE_S = 0.12
 PIPE_IDLE_PROMPT_S = 0.25
 PIPE_BUSY_CPU_S = 0.02
 
-GCC_FLAGS = ["-std=c11", "-O1", "-pipe", "-Wall", "-Wextra"]
+# _GNU_SOURCE keeps C11 but exposes common library extras such as M_PI and
+# strdup, which strict -std=c11 hides on both glibc and MinGW.
+GCC_FLAGS = ["-std=c11", "-D_GNU_SOURCE", "-O1", "-pipe", "-Wall"]
 if IS_WINDOWS:
     # MinGW: link statically so the program needs no MinGW DLLs on PATH. The
     # hardening flags below need libssp on many MinGW builds, so they are
@@ -159,7 +184,16 @@ def _child_env(workdir: Path) -> dict[str, str]:
 def _gcc_env(workdir: Path) -> dict[str, str]:
     # MinGW's gcc finds its assembler, linker and DLLs through PATH, so on
     # Windows it gets the server's environment. gcc itself is trusted.
-    return dict(os.environ) if IS_WINDOWS else _child_env(workdir)
+    if not IS_WINDOWS:
+        return _child_env(workdir)
+    env = dict(os.environ)
+    gcc_dir = os.path.dirname(GCC)
+    if gcc_dir:
+        # gcc found in C:\msys64 (or via NLC_GCC) may not be on PATH; its
+        # helpers (cc1, as, ld) need the DLLs in that same folder.
+        path_key = next((k for k in env if k.upper() == "PATH"), "PATH")
+        env[path_key] = gcc_dir + os.pathsep + env.get(path_key, "")
+    return env
 
 
 # --- compilation ----------------------------------------------------------
@@ -205,17 +239,23 @@ async def compile_source(source: str) -> CompileResult:
         )
     except FileNotFoundError:
         hint = (
-            "Install MinGW-w64 (for example via MSYS2) and add its bin folder to PATH, "
-            "or set NLC_GCC to the full path of gcc.exe."
+            "Install MSYS2 from https://www.msys2.org/, then in the \"MSYS2 UCRT64\" window run: "
+            "pacman -S mingw-w64-ucrt-x86_64-gcc  (the app finds C:\\msys64 by itself; "
+            "for another location set NLC_GCC). Then restart the app."
             if IS_WINDOWS
-            else "Install gcc (for example: sudo apt install gcc), or set NLC_GCC to its path."
+            else "Install it (for example: sudo apt install gcc), then restart the app."
         )
-        return CompileResult(False, f"gcc was not found at {GCC!r}. {hint}\n", None, workdir, -1)
+        return CompileResult(False, f"gcc (the C compiler) was not found. {hint}\n", None, workdir, -1)
     except OSError as exc:
         return CompileResult(False, f"could not start gcc: {exc}\n", None, workdir, -1)
 
     diagnostics = result.stdout.decode("utf-8", "replace")
     ok = result.returncode == 0 and exe_path.exists()
+    if result.returncode == 0 and not ok:
+        diagnostics += (
+            "gcc finished but the program file is missing. "
+            "Antivirus software may have removed it.\n"
+        )
     # Belt and braces: gcc may still print absolute paths (e.g. for headers).
     for prefix in (f"{workdir}{os.sep}", f"{workdir}/", str(workdir)):
         diagnostics = diagnostics.replace(prefix, "")
@@ -224,6 +264,17 @@ async def compile_source(source: str) -> CompileResult:
 
 
 # --- execution ------------------------------------------------------------
+
+
+def _too_long_message() -> str:
+    return (
+        f"The program ran for more than {RUN_WALL_TIMEOUT_S:.0f}s "
+        "(not counting time spent waiting for input) and was stopped."
+    )
+
+
+def _session_limit_message() -> str:
+    return f"The program was stopped after {RUN_SESSION_LIMIT_S / 60:.0f} minutes."
 
 
 def _waiting_for_stdin(pid: int) -> bool:
@@ -475,16 +526,28 @@ class _PtyExecution:
         await self._emit({"type": "exit", "code": code, "phase": "run"})
 
     async def _enforce_wall_clock(self) -> None:
-        try:
-            await asyncio.wait_for(self._finished.wait(), timeout=RUN_WALL_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            await self._emit(
-                {
-                    "type": "error",
-                    "message": f"The program ran longer than {RUN_WALL_TIMEOUT_S:.0f}s and was stopped.",
-                }
-            )
-            self._signal_group(signal.SIGKILL)
+        """Stop the program after RUN_WALL_TIMEOUT_S of running time.
+
+        Time spent waiting for the user to type is not counted, so an
+        interactive program is not killed while someone thinks. Separately,
+        nothing runs longer than RUN_SESSION_LIMIT_S in total.
+        """
+        active = 0.0
+        started = last = time.monotonic()
+        while not self._finished.is_set():
+            try:
+                await asyncio.wait_for(self._finished.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
+            now = time.monotonic()
+            if not self._prompted:
+                active += now - last
+            last = now
+            if active > RUN_WALL_TIMEOUT_S or now - started > RUN_SESSION_LIMIT_S:
+                message = _too_long_message() if active > RUN_WALL_TIMEOUT_S else _session_limit_message()
+                await self._emit({"type": "error", "message": message})
+                self._signal_group(signal.SIGKILL)
+                return
 
 
 # --- pipe backend (Windows; NLC_EXEC_MODE=pipe elsewhere) --------------------
@@ -823,7 +886,8 @@ class _PipeExecution:
 
     async def _watch(self) -> None:
         """Detect input waits, and enforce CPU and wall-clock limits."""
-        started = time.monotonic()
+        active = 0.0                      # running time, excluding input waits
+        started = last_tick = time.monotonic()
         last_cpu = _cpu_seconds(self._proc)
         while self._proc.poll() is None:
             await asyncio.sleep(IDLE_PROBE_S)
@@ -838,8 +902,16 @@ class _PipeExecution:
                 self._stop_reason = f"The program used more than {RUN_CPU_SECONDS}s of CPU time and was stopped."
                 self._kill()
                 return
-            if time.monotonic() - started > RUN_WALL_TIMEOUT_S:
-                self._stop_reason = f"The program ran longer than {RUN_WALL_TIMEOUT_S:.0f}s and was stopped."
+            now = time.monotonic()
+            if not self._prompted:
+                active += now - last_tick
+            last_tick = now
+            if active > RUN_WALL_TIMEOUT_S or now - started > RUN_SESSION_LIMIT_S:
+                # On Windows a sleeping program looks like one waiting for
+                # input, so the session limit is what eventually stops it.
+                self._stop_reason = (
+                    _too_long_message() if active > RUN_WALL_TIMEOUT_S else _session_limit_message()
+                )
                 self._kill()
                 return
 

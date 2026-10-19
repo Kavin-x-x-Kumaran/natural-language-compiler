@@ -1,6 +1,6 @@
 fastapi==0.146.0
-uvicorn[standard]==0.54.0   # [standard] adds WebSocket support for /ws/run
-websockets==17.2
+uvicorn==0.54.0             # web server; WebSockets come from the websockets line
+websockets==17.2            # /ws/run (compile & run); needs Python 3.11+
 pydantic==2.14.1
 httpx==0.28.1               # client for the llama.cpp server
 python-dotenv==1.2.4        # loads backend/.env

@@ -1,5 +1,7 @@
 import asyncio
 import os
+import re
+import shutil
 from pathlib import Path
 
 import httpx
@@ -11,17 +13,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from compiler import MAX_SOURCE_BYTES, Execution, compile_source
-
 BASE_DIR = Path(__file__).resolve().parent
+# Load .env before importing compiler, which reads NLC_GCC / NLC_EXEC_MODE.
+# Every setting has a default, so backend/.env is optional.
 load_dotenv(BASE_DIR / ".env")
 
-COMPILE_ROUTE = os.environ["COMPILE_ROUTE"]
+from compiler import GCC, MAX_SOURCE_BYTES, Execution, compile_source  # noqa: E402
+
+COMPILE_ROUTE = os.environ.get("COMPILE_ROUTE", "/compile")
 WS_RUN_ROUTE = os.environ.get("WS_RUN_ROUTE", "/ws/run")
-SERVER_PORT = int(os.environ["SERVER_PORT"])
-LLAMA_PORT = int(os.environ["LLAMA_PORT"])
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
+LLAMA_PORT = int(os.environ.get("LLAMA_PORT", "8080"))
 
 LLAMA_URL = f"http://127.0.0.1:{LLAMA_PORT}/v1/chat/completions"
+LLAMA_HEALTH_URL = f"http://127.0.0.1:{LLAMA_PORT}/health"
+MODEL_DOWN_MESSAGE = (
+    f"The AI model is not running. Start llama-server on port {LLAMA_PORT} "
+    "(see the README), then press Run again."
+)
 MODEL = "Qwen3-4B-Q4_K_M.gguf"
 TEMPERATURE = 0.1
 DELIMITER = "\nNL_CODE_START\n"
@@ -32,6 +41,39 @@ PREFIX = (BASE_DIR / "prefix.txt").read_text(encoding="utf-8")
 class NLLine(BaseModel):
     line: int
     text: str
+
+
+_THINK_BLOCK = re.compile(r"<think>.*?(?:</think>|\Z)", re.DOTALL | re.IGNORECASE)
+# Fences only count at the start of a line, so ``` inside a C string is kept.
+_FENCED_BLOCK = re.compile(r"^[ \t]*```[^\n`]*\n(.*?)(?:^[ \t]*```|\Z)", re.DOTALL | re.MULTILINE)
+_ERROR_LINE = re.compile(r"ERROR:\s*[A-Z_]+\s*\|[^\n]*")
+
+
+def clean_model_output(text: str | None) -> str:
+    """Reduce the model's reply to what belongs in the C editor.
+
+    Qwen3 may prepend its reasoning ("<think>...</think>") and small models
+    often wrap code in markdown fences despite prefix.txt. Neither should reach
+    gcc. A refusal is reduced to its "ERROR: CODE | reason" line, which the
+    frontend shows as an error rather than as code.
+    """
+    text = text or ""
+    if "</think>" in text.lower():
+        text = text[text.lower().rindex("</think>") + len("</think>"):]
+    text = _THINK_BLOCK.sub("", text).strip()
+
+    unquoted = text.strip("`'\" \n")
+    if unquoted.startswith("ERROR:"):
+        match = _ERROR_LINE.match(unquoted)
+        return match.group(0).strip() if match else unquoted.splitlines()[0].strip()
+
+    fenced = _FENCED_BLOCK.search(text)
+    if fenced:
+        text = fenced.group(1)
+    text = text.strip("\n")
+    if not text.strip():
+        return "ERROR: EMPTY_OUTPUT | The model returned no code. Press Run again."
+    return text + "\n"
 
 
 app = FastAPI()
@@ -60,23 +102,66 @@ async def compile_nl(lines: list[NLLine]):
         "model": MODEL,
         "messages": [{"role": "user", "content": PREFIX + DELIMITER + nl_code}],
         "temperature": TEMPERATURE,
+        # Qwen3 "thinks" before answering by default, which is slow on a laptop
+        # CPU and adds nothing here. Builds that ignore this kwarg are handled
+        # by clean_model_output.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     try:
-        # No timeout: generation time depends on model load and output length.
-        async with httpx.AsyncClient(timeout=None) as client:
+        # No read timeout: generation time depends on the PC and output length.
+        # trust_env=False: llama-server is local, so never route via a proxy.
+        timeout = httpx.Timeout(None, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.post(LLAMA_URL, json=payload)
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        return JSONResponse(status_code=503, content={"error": MODEL_DOWN_MESSAGE})
+    except httpx.HTTPError as e:
         print(f"llama.cpp request failed: {e!r}")
-        return JSONResponse(status_code=500, content={"error": "llama.cpp server is down"})
+        return JSONResponse(
+            status_code=502, content={"error": f"Could not get an answer from llama-server: {e}"}
+        )
 
-    # Placeholder: display the generated output.
-    print(content)
-    # `code` is passed through verbatim; the frontend treats a value starting
-    # with "ERROR:" (prefix.txt's rejection format) as an error, not as code.
-    return {"code": content}
+    if response.status_code >= 400:
+        try:
+            detail = response.json()["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            detail = response.text[:200] or response.reason_phrase
+        if response.status_code == 503 and "load" in str(detail).lower():
+            message = "The AI model is still loading. Wait a few seconds, then press Run again."
+        else:
+            message = f"llama-server returned an error: {detail}"
+        return JSONResponse(status_code=502, content={"error": message})
+
+    try:
+        choice = response.json()["choices"][0]
+        content = choice["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return JSONResponse(
+            status_code=502, content={"error": "llama-server sent a reply the backend could not read."}
+        )
+    if choice.get("finish_reason") == "length":
+        return {"code": "ERROR: OUTPUT_TOO_LONG | The answer was cut off. Try fewer or simpler steps."}
+
+    # The frontend treats a value starting with "ERROR:" (prefix.txt's
+    # rejection format) as an error, not as code.
+    return {"code": clean_model_output(content)}
+
+
+@app.get("/health")
+async def health() -> dict:
+    """Used by the frontend's status chip: is the backend up, is the model up?"""
+    try:
+        async with httpx.AsyncClient(timeout=1.5, trust_env=False) as client:
+            model_ok = (await client.get(LLAMA_HEALTH_URL)).status_code == 200
+    except httpx.HTTPError:
+        model_ok = False
+    return {"backend": "ok", "model": "ok" if model_ok else "down", "gcc": GCC}
+
+
+@app.get("/")
+async def root() -> dict:
+    return {"status": "backend running", "app": "open http://localhost:5173"}
 
 
 @app.websocket(WS_RUN_ROUTE)
@@ -127,8 +212,10 @@ async def run_program(websocket: WebSocket) -> None:
         workdir = result.workdir
 
         if result.diagnostics.strip():
-            # Warnings on success, errors on failure: both belong on stderr.
-            await websocket.send_json({"type": "stderr", "data": result.diagnostics})
+            text = result.diagnostics
+            if result.ok:
+                text = "gcc warnings (the program still compiled):\n" + text
+            await websocket.send_json({"type": "stderr", "data": text})
 
         if not result.ok:
             await websocket.send_json(
@@ -140,7 +227,15 @@ async def run_program(websocket: WebSocket) -> None:
         await websocket.send_json({"type": "status", "state": "running"})
         execution = Execution(result.exe_path, result.workdir)
         workdir = None  # Execution.close() owns the directory from here on
-        await execution.start()
+        try:
+            await execution.start()
+        except OSError as exc:
+            await websocket.send_json({
+                "type": "error",
+                "message": f"Could not start the compiled program ({exc}). "
+                "Antivirus software may be blocking it.",
+            })
+            return
 
         await _pump_session(websocket, execution)
 
@@ -158,8 +253,6 @@ async def run_program(websocket: WebSocket) -> None:
         if execution is not None:
             await execution.close()
         elif workdir is not None:
-            import shutil
-
             shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -199,4 +292,7 @@ async def _pump_session(websocket: WebSocket, execution: Execution) -> None:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=SERVER_PORT)
+    print(f"Backend running on http://127.0.0.1:{SERVER_PORT}  (gcc: {GCC})", flush=True)
+    # Quiet logs: the UI checks /health every few seconds, and per-request
+    # lines would bury anything useful. Warnings and errors still show.
+    uvicorn.run(app, host="127.0.0.1", port=SERVER_PORT, access_log=False, log_level="warning")

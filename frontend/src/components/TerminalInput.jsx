@@ -22,7 +22,7 @@ export default function TerminalInput({ value, onChange, onSubmit, waiting }) {
         value={value}
         aria-label="Program input"
         disabled={!waiting}
-        placeholder={waiting ? '' : 'Program is not asking for input'}
+        placeholder={waiting ? 'Type the input and press Enter' : 'Program is not asking for input'}
         autoComplete="off"
         spellCheck={false}
         onChange={(event) => onChange(event.target.value)}

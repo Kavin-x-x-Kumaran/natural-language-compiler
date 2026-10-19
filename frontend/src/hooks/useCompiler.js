@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { buildPayload } from '../utils/buildPayload.js';
 import { terminalReducer } from '../utils/terminalReducer.js';
 import { MAX_LINES, STOP_TIMEOUT_MS } from '../utils/constants.js';
-import { generateCode } from '../services/api.js';
+import { checkHealth, generateCode } from '../services/api.js';
 import { startRun } from '../services/websocket.js';
 import { MOCK_ENABLED } from '../services/endpoints.js';
 
@@ -13,6 +13,14 @@ export const isExecActive = (status) => ACTIVE_EXEC.has(status);
 
 const mockTag = (text) => (MOCK_ENABLED ? `[mock] ${text}` : text);
 
+const HEALTH_POLL_MS = 10000;
+
+/** "ERROR: INVALID_INPUT | The request is empty." -> the readable reason. */
+const refusalReason = (output) => {
+  const reason = output.split('|').slice(1).join('|').trim();
+  return reason || output.replace(/^ERROR:\s*/, '');
+};
+
 /**
  * Generation + execution state machine, per tab.
  *
@@ -21,15 +29,31 @@ const mockTag = (text) => (MOCK_ENABLED ? `[mock] ${text}` : text);
  * one, and results always land in the tab that started them.
  */
 export function useCompiler({ updateTab, tabsRef }) {
-  const [connection, setConnection] = useState(MOCK_ENABLED ? 'mock' : 'disconnected');
+  // 'checking' until the first health check answers; then 'ready',
+  // 'model-offline' (backend up, llama-server not) or 'disconnected'.
+  const [connection, setConnection] = useState(MOCK_ENABLED ? 'mock' : 'checking');
 
   const abortControllers = useRef(new Map()); // tabId -> AbortController
   const handles = useRef(new Map()); // tabId -> run handle
   const stopTimers = useRef(new Map()); // tabId -> timeout id
   const sessionCounters = useRef(new Map()); // tabId -> last session number
 
+  const refreshHealth = useCallback(async () => {
+    if (MOCK_ENABLED) return;
+    setConnection(await checkHealth());
+  }, []);
+
+  // Ask the backend how things are on load and every few seconds, so the
+  // chip is right before anyone presses a button.
+  useEffect(() => {
+    if (MOCK_ENABLED) return undefined;
+    refreshHealth();
+    const timer = setInterval(refreshHealth, HEALTH_POLL_MS);
+    return () => clearInterval(timer);
+  }, [refreshHealth]);
+
   const markConnected = useCallback(() => {
-    if (!MOCK_ENABLED) setConnection('connected');
+    if (!MOCK_ENABLED) setConnection('ready');
   }, []);
   const markDisconnected = useCallback(() => {
     if (!MOCK_ENABLED) setConnection('disconnected');
@@ -157,6 +181,10 @@ export function useCompiler({ updateTab, tabsRef }) {
 
       updateTab(tabId, (current) => ({
         gen: { status: 'generating', error: null, durationMs: null },
+        // A finished run's "Process finished" must not linger in the status bar.
+        exec: isExecActive(current.exec.status)
+          ? current.exec
+          : { ...current.exec, status: 'idle', exitCode: null },
         terminal: terminalReducer(current.terminal, {
           type: 'append',
           kind: 'status',
@@ -172,14 +200,14 @@ export function useCompiler({ updateTab, tabsRef }) {
           const durationMs = Date.now() - startedAt;
           markConnected();
 
-          if (output.startsWith('ERROR:')) {
+          if (output.trimStart().startsWith('ERROR:')) {
             // The backend's documented rejection format. Never goes in the editor.
             updateTab(tabId, (current) => ({
               gen: { status: 'error', error: output, durationMs },
               terminal: terminalReducer(current.terminal, {
                 type: 'append',
                 kind: 'error',
-                text: output,
+                text: `The model could not turn these steps into C: ${refusalReason(output.trim())}`,
               }),
             }));
             return;
@@ -303,14 +331,25 @@ export function useCompiler({ updateTab, tabsRef }) {
           break;
 
         case 'input_required':
-          append(tabId, 'status', mockTag('Waiting for input...'), sessionId);
+          // The status bar and the unlocked input box say it; no extra line.
           patchExec(tabId, sessionId, { status: 'waiting_input' });
           break;
 
         case 'exit': {
           const code = Number.isInteger(event.code) ? event.code : null;
-          const failed = event.phase === 'compile' || (code !== null && code !== 0);
           clearStopTimer(tabId);
+          if (current.exec.status === 'stopping') {
+            // The user pressed Stop: that is not a failure.
+            append(tabId, 'status', 'Stopped', sessionId);
+            patchExec(tabId, sessionId, { status: 'stopped', exitCode: code });
+            break;
+          }
+          if (event.phase === 'compile') {
+            append(tabId, 'error', 'Compilation failed. See the gcc messages above.', sessionId);
+            patchExec(tabId, sessionId, { status: 'failed', exitCode: code, failedPhase: 'compile' });
+            break;
+          }
+          const failed = code !== null && code !== 0;
           append(
             tabId,
             failed ? 'error' : 'status',
@@ -320,6 +359,7 @@ export function useCompiler({ updateTab, tabsRef }) {
           patchExec(tabId, sessionId, {
             status: failed ? 'failed' : 'finished',
             exitCode: code,
+            failedPhase: null,
           });
           break;
         }
@@ -332,7 +372,9 @@ export function useCompiler({ updateTab, tabsRef }) {
             sessionId
           );
           patchExec(tabId, sessionId, { status: 'failed' });
-          markDisconnected();
+          // Only a broken connection means the backend is gone; a program
+          // hitting its CPU limit, for example, does not.
+          if (event.network) markDisconnected();
           break;
 
         default:

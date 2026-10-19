@@ -10,11 +10,12 @@ function statusLine(gen, exec) {
   if (exec.status === 'waiting_input') return ['Waiting for input...', 'busy'];
   if (exec.status === 'stopping') return ['Stopping...', 'busy'];
   if (exec.status === 'stopped') return ['Stopped', 'neutral'];
-  if (exec.status === 'failed') return ['Failed', 'bad'];
+  if (exec.status === 'failed')
+    return [exec.failedPhase === 'compile' ? 'Compilation failed' : 'Failed', 'bad'];
   if (exec.status === 'finished')
     return [`Process finished (exit code ${exec.exitCode ?? 'unknown'})`, exec.exitCode ? 'bad' : 'good'];
   if (gen.status === 'generating') return ['Generating...', 'busy'];
-  if (gen.status === 'error') return ['Failed', 'bad'];
+  if (gen.status === 'error') return ['Code generation failed', 'bad'];
   return ['Ready', 'neutral'];
 }
 

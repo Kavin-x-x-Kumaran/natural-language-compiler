@@ -1,0 +1,5 @@
+{
+  // Windows PowerShell often blocks npm ("running scripts is disabled on this
+  // system"). Command Prompt does not, so use it for this project's terminal.
+  "terminal.integrated.defaultProfile.windows": "Command Prompt"
+}

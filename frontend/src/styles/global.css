@@ -152,10 +152,14 @@ button, input, textarea { font-family: inherit; color: inherit; }
   background: var(--gutter);
   flex: 0 0 auto;
 }
-.status-chip[data-state='connected'] { color: var(--text-body); }
-.status-chip[data-state='connected'] .status-dot { background: var(--green); }
-.status-chip[data-state='mock'] { color: var(--amber); }
-.status-chip[data-state='mock'] .status-dot { background: var(--amber); }
+.status-chip[data-state='ready'] { color: var(--text-body); }
+.status-chip[data-state='ready'] .status-dot { background: var(--green); }
+.status-chip[data-state='mock'],
+.status-chip[data-state='model-offline'] { color: var(--amber); }
+.status-chip[data-state='mock'] .status-dot,
+.status-chip[data-state='model-offline'] .status-dot { background: var(--amber); }
+.status-chip[data-state='disconnected'] { color: var(--red); }
+.status-chip[data-state='disconnected'] .status-dot { background: var(--red); }
 
 /* ==========================================================================
    Workspace

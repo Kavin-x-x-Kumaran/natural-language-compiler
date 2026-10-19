@@ -6,69 +6,61 @@ The backend does not download or start the model server. The `llama.cpp` server 
 
 ## Setup
 
+**The easy way:** from the repository root run `npm run dev`. It sets up Python, installs the packages and starts the backend and the frontend together. See the [root README](../README.md). The steps below are for running the backend on its own.
+
 ### 1. Install gcc
 
 The backend compiles generated C with gcc. It runs on Linux, macOS and Windows.
 
 - **Linux / macOS:** install gcc with your package manager, such as `sudo apt install gcc` on Ubuntu.
-- **Windows:** install MinGW-w64, for example through [MSYS2](https://www.msys2.org/) with `pacman -S mingw-w64-ucrt-x86_64-gcc`. Add its `bin` folder (such as `C:\msys64\ucrt64\bin`) to `PATH`, or set `NLC_GCC` to the full path of `gcc.exe`.
+- **Windows:** install [MSYS2](https://www.msys2.org/), then in the "MSYS2 UCRT64" window run `pacman -S mingw-w64-ucrt-x86_64-gcc`. The backend finds gcc in `C:\msys64` by itself. For another location, add its `bin` folder to `PATH` or set `NLC_GCC` to the full path of `gcc.exe`.
 
-Check the installation with `gcc --version` in a new terminal. If gcc is missing, Compile & Run reports how to install it.
+If gcc is missing, Compile & Run says how to install it.
 
 ### 2. Install dependencies
 
-From the repository root, install the Python dependencies:
+Python 3.11 or newer is required. From the repository root:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt      # Windows: py -m pip install -r requirements.txt
 ```
 
-### 3. Configure environment variables
+### 3. Configure (optional)
 
-Create `backend/.env` with the following configuration:
-
-```dotenv
-COMPILE_ROUTE=/compile
-SERVER_PORT=8000
-LLAMA_PORT=8080
-```
-
-These values configure the HTTP generation endpoint, the FastAPI server port, and the local `llama.cpp` server port, respectively.
+Nothing needs configuring: every setting has a default. To change one, copy `backend/.env.example` to `backend/.env` and edit it. See [Configuration](#configuration).
 
 ### 4. Start the model server
 
-Start a `llama.cpp` server separately, exposing its OpenAI-compatible chat completions endpoint at:
+Install [llama.cpp](https://github.com/ggml-org/llama.cpp) (on Windows: `winget install llama.cpp`), then run:
 
-```text
-http://127.0.0.1:8080/v1/chat/completions
+```bash
+llama-server -hf Qwen/Qwen3-4B-GGUF:Q4_K_M --port 8080 -c 8192 --jinja
 ```
 
-The server should serve the model `Qwen3-4B-Q4_K_M.gguf`.
+The first run downloads the Qwen3-4B model (about 2.5 GB). `-c 8192` leaves room for the roughly 2,000-token prompt, and `--jinja` lets the backend turn off Qwen3's slow "thinking" mode. The backend talks to `http://127.0.0.1:8080/v1/chat/completions`.
 
 ### 5. Start the backend
 
 From the repository root, run:
 
 ```bash
-python backend/main.py
+python backend/main.py      # Windows: py backend\main.py
 ```
 
-The API listens on `127.0.0.1:8000` by default, according to the example configuration.
-
-If you change `SERVER_PORT` or `LLAMA_PORT`, ensure that the frontend's API base URL and the backend's connection to `llama.cpp` use the corresponding ports.
+The API listens on `127.0.0.1:8000`. If you change `SERVER_PORT`, also set `VITE_API_BASE_URL` and `VITE_WS_BASE_URL` in `frontend/.env`.
 
 ## Configuration
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `COMPILE_ROUTE` | Yes | HTTP path for the code-generation endpoint, such as `/compile`. |
-| `SERVER_PORT` | Yes | Port used by the FastAPI server. |
-| `LLAMA_PORT` | Yes | Port used by the local `llama.cpp` server. |
-| `WS_RUN_ROUTE` | No | WebSocket path for compiling and running C. Defaults to `/ws/run`. |
-| `NLC_GCC` | No | Full path to gcc, such as `C:\msys64\ucrt64\bin\gcc.exe`. Defaults to `gcc` on `PATH`. |
+| `SERVER_PORT` | No | Port used by the FastAPI server. Defaults to `8000`. |
+| `LLAMA_PORT` | No | Port used by the local `llama.cpp` server. Defaults to `8080`. |
+| `COMPILE_ROUTE` | No | HTTP path for code generation. Defaults to `/compile`; the frontend expects this path. |
+| `WS_RUN_ROUTE` | No | WebSocket path for compiling and running C. Defaults to `/ws/run`; the frontend expects this path. |
+| `NLC_GCC` | No | Full path to gcc, such as `C:/msys64/ucrt64/bin/gcc.exe`. Defaults to `gcc` on `PATH`, then the usual MSYS2/MinGW folders on Windows. |
 | `NLC_EXEC_MODE` | No | `pty` (default on Linux and macOS) or `pipe` (always used on Windows). Set `pipe` on Linux to test the Windows execution path. |
 
-The variables are loaded from `backend/.env` or the process environment. The first three must be configured; the application does not provide code-level defaults for them.
+The variables are loaded from `backend/.env` (optional; see `backend/.env.example`) or the process environment.
 
 The model name, temperature (`0.1`), and request prompt are configured in `main.py`.
 
@@ -107,14 +99,21 @@ Example response:
 }
 ```
 
-The `code` field contains the model output verbatim.
+The `code` field contains the model's answer after light clean-up: any Qwen3 "thinking" text (`<think>…</think>`) and markdown code fences (```` ```c ````) are removed, because neither should reach gcc. A refusal is reduced to its `ERROR: CODE | reason` line (the format `prefix.txt` defines), which the frontend shows as an error instead of putting it in the editor.
 
-**Error handling:**
+**Error handling.** Failures return `{"error": "<message for the user>"}`:
 
-- `422 Unprocessable Entity`: FastAPI rejects invalid request data.
-- `500 Internal Server Error`: The `llama.cpp` request fails. The response detail is `llama.cpp server is down`.
+- `422`: the request body is not a JSON array of `{line, text}`.
+- `503`: llama-server is not running ("The AI model is not running. Start llama-server on port 8080…").
+- `502`: llama-server answered with an error, e.g. while the model is still loading.
 
-Generation has no request timeout because the duration depends on model loading and output length.
+The backend waits as long as generation takes; the browser gives up after 5 minutes.
+
+### Health check
+
+**Endpoint:** `GET /health` → `{"backend": "ok", "model": "ok" | "down", "gcc": "<path>"}`
+
+The frontend calls this every few seconds to set the status chip in the header.
 
 ### 2. Compile and run C programs
 
@@ -199,16 +198,16 @@ program.c:4:5: error: ...
 GCC uses the following flags on Linux and macOS:
 
 ```text
--std=c11 -O1 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2
+-std=c11 -D_GNU_SOURCE -O1 -pipe -Wall -fstack-protector-strong -D_FORTIFY_SOURCE=2
 ```
 
 On Windows (MinGW-w64):
 
 ```text
--std=c11 -O1 -Wall -Wextra -static
+-std=c11 -D_GNU_SOURCE -O1 -pipe -Wall -static
 ```
 
-`-static` means the program needs no MinGW DLLs at run time. The hardening flags are omitted on Windows because many MinGW builds need an extra library for them. The executable is linked with `-lm` for mathematical functions.
+`-D_GNU_SOURCE` keeps C11 but makes common extras such as `M_PI` and `strdup` available; strict `-std=c11` hides them, which breaks programs like "area of a circle". `-static` means the program needs no MinGW DLLs at run time. The hardening flags are omitted on Windows because many MinGW builds need an extra library for them. The executable is linked with `-lm` for mathematical functions. Warnings on a successful build are shown under the heading "gcc warnings (the program still compiled)".
 
 ## Execution limits
 
@@ -218,7 +217,8 @@ The execution service applies the following resource limits:
 | --- | --- |
 | GCC wall-clock time | 20 seconds |
 | Program CPU time | 5 seconds (`RLIMIT_CPU`; on Windows, polled CPU time with a Job Object backstop) |
-| Program wall-clock time | 60 seconds |
+| Program running time | 60 seconds, not counting time spent waiting for the user to type |
+| Total time per run | 15 minutes, including input waits |
 | Memory | 256 MB (`RLIMIT_AS`; Job Object on Windows) |
 | File writes | 8 MB (`RLIMIT_FSIZE`; not limited on Windows) |
 | Child processes | 64 per user on Linux; none allowed on Windows (Job Object) |
@@ -255,13 +255,14 @@ CORS currently allows requests from any origin. This configuration is intended f
 | `backend/main.py` | FastAPI application, HTTP request handling, and local model-server client. |
 | `backend/compiler.py` | GCC compilation, process execution, resource limits, and WebSocket streaming. |
 | `backend/prefix.txt` | Prompt instructions prepended to each generation request. |
-| `backend/.env` | Local service ports and HTTP route configuration; not committed to version control. |
-| `requirements.txt` | Python dependencies installed by pip. |
+| `backend/.env.example` | Optional settings; copy to `backend/.env` (not committed) to change them. |
+| `requirements.txt` | Python dependencies installed by pip (Python 3.11+). |
+| `scripts/dev.mjs` | The `npm run dev` launcher: sets up Python and starts backend + frontend. |
 
 ## Limitations
 
 - Code generation requires a separately running `llama.cpp` server with the configured model available.
-- Generation has no request timeout.
+- The browser stops waiting for generated code after 5 minutes.
 - Generated C is compiled and executed through the WebSocket endpoint, subject to the documented resource limits.
 - Windows enforces fewer limits than Linux: there is no file-size limit, and a program runs for a moment before its memory, CPU and child-process limits apply.
 - The execution service is not a complete security sandbox. Additional OS-level isolation is required before running untrusted programs.
