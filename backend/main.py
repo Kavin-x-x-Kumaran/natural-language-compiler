@@ -34,12 +34,6 @@ class NLLine(BaseModel):
     text: str
 
 
-class CompileRequest(BaseModel):
-    """Body the frontend sends: {"nl_code": [{"line": 1, "text": "..."}]}."""
-
-    nl_code: list[NLLine]
-
-
 app = FastAPI()
 
 
@@ -48,7 +42,7 @@ async def invalid_request(_: Request, exc: RequestValidationError) -> JSONRespon
     # The frontend reads `error` from failure bodies; FastAPI's default is `detail`.
     return JSONResponse(
         status_code=422,
-        content={"error": "Request body must be {\"nl_code\": [{\"line\": int, \"text\": str}]}."},
+        content={"error": "Request body must be a JSON array of {\"line\": int, \"text\": str}."},
     )
 
 app.add_middleware(
@@ -60,8 +54,7 @@ app.add_middleware(
 
 
 @app.post(COMPILE_ROUTE)
-async def compile_nl(request: CompileRequest):
-    lines = request.nl_code
+async def compile_nl(lines: list[NLLine]):
     nl_code = "\n".join(f"{l.line}. {l.text}" for l in sorted(lines, key=lambda l: l.line))
     payload = {
         "model": MODEL,
@@ -81,9 +74,9 @@ async def compile_nl(request: CompileRequest):
 
     # Placeholder: display the generated output.
     print(content)
-    # `output` is passed through verbatim; the frontend treats a value starting
+    # `code` is passed through verbatim; the frontend treats a value starting
     # with "ERROR:" (prefix.txt's rejection format) as an error, not as code.
-    return {"output": content}
+    return {"code": content}
 
 
 @app.websocket(WS_RUN_ROUTE)
