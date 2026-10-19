@@ -1,11 +1,12 @@
-# Natural language compiler — backend
+# Natural Language Compiler — Backend
 
-FastAPI service that turns numbered natural-language instructions into C
-source using a local `llama.cpp` server and the Qwen3-4B model. It implements
-the frontend's HTTP generation endpoint; compiling and running generated C
-code is not implemented by this backend.
+FastAPI backend for a Natural-Language-to-C compiler. It converts numbered natural-language instructions into C source code using a locally hosted Qwen3-4B model served through `llama.cpp`. It also supports compiling and running generated C programs through a WebSocket endpoint, streaming program output, handling interactive input, and reporting compilation or execution errors.
+
+The backend does not download or start the model server. The `llama.cpp` server must be started separately.
 
 ## Setup
+
+### 1. Install dependencies
 
 From the repository root, install the Python dependencies:
 
@@ -13,7 +14,9 @@ From the repository root, install the Python dependencies:
 pip install -r requirements.txt
 ```
 
-Create `backend/.env` with the service and `llama.cpp` ports:
+### 2. Configure environment variables
+
+Create `backend/.env` with the following configuration:
 
 ```dotenv
 COMPILE_ROUTE=/compile
@@ -21,125 +24,225 @@ SERVER_PORT=8000
 LLAMA_PORT=8080
 ```
 
-Start a `llama.cpp` server separately, exposing its OpenAI-compatible chat
-completions endpoint at `http://127.0.0.1:8080/v1/chat/completions` and serving
-the model `Qwen3-4B-Q4_K_M.gguf`. The backend does not download or start the
-model server.
+These values configure the HTTP generation endpoint, the FastAPI server port, and the local `llama.cpp` server port, respectively.
 
-Run the API from the repository root:
+### 3. Start the model server
+
+Start a `llama.cpp` server separately, exposing its OpenAI-compatible chat completions endpoint at:
+
+```text
+http://127.0.0.1:8080/v1/chat/completions
+```
+
+The server should serve the model `Qwen3-4B-Q4_K_M.gguf`.
+
+### 4. Start the backend
+
+From the repository root, run:
 
 ```bash
 python backend/main.py
 ```
 
-The API listens on `127.0.0.1:8000` by default. Change `SERVER_PORT` or
-`LLAMA_PORT` in `backend/.env` to use different ports; keep the frontend's API
-base URL and the `llama.cpp` server address in sync.
+The API listens on `127.0.0.1:8000` by default, according to the example configuration.
+
+If you change `SERVER_PORT` or `LLAMA_PORT`, ensure that the frontend's API base URL and the backend's connection to `llama.cpp` use the corresponding ports.
 
 ## Configuration
 
-| variable | required | default | description |
-| --- | --- | --- | --- |
-| `COMPILE_ROUTE` | yes | — | HTTP path for the generation endpoint, such as `/compile` |
-| `SERVER_PORT` | yes | — | Port used by the FastAPI server |
-| `LLAMA_PORT` | yes | — | Port of the local `llama.cpp` server |
+| Variable | Required | Description |
+| --- | --- | --- |
+| `COMPILE_ROUTE` | Yes | HTTP path for the code-generation endpoint, such as `/compile`. |
+| `SERVER_PORT` | Yes | Port used by the FastAPI server. |
+| `LLAMA_PORT` | Yes | Port used by the local `llama.cpp` server. |
 
-These variables are loaded from `backend/.env` or the process environment.
-There are no code defaults; all three must be set. The model name,
-temperature (`0.1`), and request prompt are configured in `main.py`.
+The variables are loaded from `backend/.env` or the process environment. All three must be configured; the application does not provide code-level defaults for them.
+
+The model name, temperature (`0.1`), and request prompt are configured in `main.py`.
 
 ## API
 
-### Generate C source
+### 1. Generate C source
 
-`POST /compile` (or the path set by `COMPILE_ROUTE`) accepts a JSON array of
-numbered instructions. The backend sorts the lines by their `line` value,
-combines them, and sends them with `prefix.txt` to the model.
+**Endpoint:** `POST {COMPILE_ROUTE}`
+
+The endpoint accepts a JSON array of numbered natural-language instructions. The backend sorts the instructions by their `line` values, combines them, prepends the contents of `prefix.txt`, and sends the resulting prompt to the local model server.
+
+Example request:
 
 ```json
 [
-  { "line": 1, "text": "Read 2 numbers as input" },
-  { "line": 2, "text": "Add them" },
-  { "line": 3, "text": "Display the answer" }
+  {
+    "line": 1,
+    "text": "Read 2 numbers as input"
+  },
+  {
+    "line": 2,
+    "text": "Add them"
+  },
+  {
+    "line": 3,
+    "text": "Display the answer"
+  }
 ]
 ```
 
-On success, the response contains the model output verbatim:
+Example response:
 
 ```json
-{ "code": "#include <stdio.h>\n..." }
+{
+  "code": "#include <stdio.h>\n..."
+}
 ```
 
-Invalid request data is rejected by FastAPI with a `422` response. If the
-`llama.cpp` request fails, the API returns `500` with the detail
-`llama.cpp server is down`. Generation has no request timeout because duration
-depends on model loading and output length.
+The `code` field contains the model output verbatim.
 
-### Running C: `WS /ws/run`
+**Error handling:**
 
-`backend/compiler.py` builds generated C with gcc and runs it, streaming the
-session over a WebSocket. Messages:
+- `422 Unprocessable Entity`: FastAPI rejects invalid request data.
+- `500 Internal Server Error`: The `llama.cpp` request fails. The response detail is `llama.cpp server is down`.
 
-```
-client -> server   {"type":"start","source":"<C source>"}
-                   {"type":"stdin","data":"10 20\n"}
-                   {"type":"stop"}
+Generation has no request timeout because the duration depends on model loading and output length.
 
-server -> client   {"type":"status","state":"compiling"|"running"}
-                   {"type":"stdout"|"stderr","data":"..."}
-                   {"type":"input_required"}
-                   {"type":"exit","code":0,"phase":"compile"|"run"}
-                   {"type":"error","message":"..."}
-```
+### 2. Compile and run C programs
 
-The program runs on a pty, so an unflushed prompt such as
-`printf("Enter a number: ")` reaches the user before the program blocks.
-`input_required` is sent when the process is actually blocked reading stdin
-(checked via `/proc/<pid>/syscall`), so a busy program is not mistaken for one
-awaiting input. Compiler diagnostics arrive as `stderr`, with the server's
-temporary path stripped so errors read `program.c:4:5: ...`.
+**Endpoint:** `WS /ws/run`
 
-Build flags: `-std=c11 -O1 -Wall -Wextra -fstack-protector-strong
--D_FORTIFY_SOURCE=2`, linked with `-lm`.
+The WebSocket endpoint, implemented in `backend/compiler.py`, compiles C source using GCC and runs the resulting program. It streams compilation status, program output, errors, and process termination information to the client.
 
-#### Limits
+#### Client-to-server messages
 
-| limit | value |
+| Message | Purpose |
 | --- | --- |
-| gcc wall clock | 20s |
-| program CPU | 5s (`RLIMIT_CPU`) |
-| program wall clock | 60s |
-| address space | 256 MB |
-| file writes | 8 MB (`RLIMIT_FSIZE`) |
-| output streamed | 1 MB, then the program is killed |
-| source accepted | 256 KB |
-| `stop` | SIGTERM to the process group, SIGKILL after 2s |
+| `start` | Submit C source for compilation and execution. |
+| `stdin` | Send input to the running program. |
+| `stop` | Stop the running process. |
 
-Each run gets a private temp directory and a scrubbed environment; the
-directory is removed when the socket closes.
+Example messages:
 
-#### Security
+```json
+{"type": "start", "source": "#include <stdio.h>\nint main(void) { printf(\"Hello\\n\"); return 0; }"}
+```
 
-These limits are defence in depth, **not a sandbox**. A hostile program can
-still read world-readable files and open network connections. Running
-untrusted C safely needs OS-level isolation — a container with a seccomp
-profile, no network namespace, and an unprivileged user. Deploy it behind
-that; `prefix.txt` asking the model to refuse unsafe programs is not a
-security boundary.
+```json
+{"type": "stdin", "data": "10 20\n"}
+```
 
+```json
+{"type": "stop"}
+```
 
-## Repository files
+#### Server-to-client messages
 
-| path | purpose |
+| Message type | Purpose |
 | --- | --- |
-| `main.py` | FastAPI endpoint, request handling, and local model-server client |
-| `prefix.txt` | Prompt instructions prepended to each generation request |
-| `.env` | Local ports and route configuration (not committed) |
+| `status` | Reports the current state: `compiling` or `running`. |
+| `stdout` | Streams standard output from the program. |
+| `stderr` | Streams compiler diagnostics or standard error output. |
+| `input_required` | Indicates that the process is blocked waiting for standard input. |
+| `exit` | Reports the exit code and phase: `compile` or `run`. |
+| `error` | Reports an execution-service error. |
+
+Example messages:
+
+```json
+{"type": "status", "state": "compiling"}
+```
+
+```json
+{"type": "status", "state": "running"}
+```
+
+```json
+{"type": "stdout", "data": "Hello\n"}
+```
+
+```json
+{"type": "exit", "code": 0, "phase": "run"}
+```
+
+#### Interactive input handling
+
+Programs run on a pseudo-terminal (PTY). This allows unflushed prompts, such as:
+
+```c
+printf("Enter a number: ");
+```
+
+to reach the client before the program blocks waiting for input.
+
+The backend detects when a process is actually blocked reading standard input using `/proc/<pid>/syscall`. It sends `input_required` when the process is waiting for input, rather than incorrectly treating a busy-running program as an interactive prompt.
+
+#### Compiler diagnostics
+
+Compiler diagnostics are streamed through `stderr`. The backend strips its temporary source-file path so that errors are displayed using a readable filename, such as:
+
+```text
+program.c:4:5: error: ...
+```
+
+#### Compilation flags
+
+GCC uses the following flags:
+
+```text
+-std=c11 -O1 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2
+```
+
+The executable is linked with `-lm` for mathematical functions.
+
+## Execution limits
+
+The execution service applies the following resource limits:
+
+| Limit | Value |
+| --- | --- |
+| GCC wall-clock time | 20 seconds |
+| Program CPU time | 5 seconds (`RLIMIT_CPU`) |
+| Program wall-clock time | 60 seconds |
+| Address space | 256 MB |
+| File writes | 8 MB (`RLIMIT_FSIZE`) |
+| Total streamed output | 1 MB; exceeding the limit kills the program |
+| Maximum accepted source size | 256 KB |
+| Stop escalation | `SIGTERM` to the process group, followed by `SIGKILL` after 2 seconds |
+
+Each execution uses a private temporary directory and a scrubbed environment. The temporary directory is removed when the WebSocket connection closes.
+
+These limits constrain resource consumption but do not constitute a complete security sandbox.
+
+## Security considerations
+
+**Do not treat the execution service as safe for arbitrary untrusted C code.**
+
+The resource limits and temporary-directory isolation provide defence in depth, but a hostile program may still read world-readable files or establish network connections.
+
+Running untrusted C code safely requires additional OS-level isolation, such as:
+
+- A container with an appropriately restrictive seccomp profile.
+- A network namespace that prevents network access.
+- An unprivileged user with minimal permissions.
+
+Deploy the execution service behind suitable isolation before allowing untrusted users to submit programs.
+
+Instructions in `prefix.txt` that ask the model to refuse unsafe programs are not a security boundary. Generated code must be treated as untrusted regardless of the prompt.
+
+CORS currently allows requests from any origin. This configuration is intended for local development and should not be exposed to untrusted networks without appropriate access controls.
+
+## Repository structure
+
+| Path | Purpose |
+| --- | --- |
+| `backend/main.py` | FastAPI application, HTTP request handling, and local model-server client. |
+| `backend/compiler.py` | GCC compilation, process execution, resource limits, and WebSocket streaming. |
+| `backend/prefix.txt` | Prompt instructions prepended to each generation request. |
+| `backend/.env` | Local service ports and HTTP route configuration; not committed to version control. |
+| `requirements.txt` | Python dependencies installed by pip. |
 
 ## Limitations
 
-- The backend only generates source code; it has no execution endpoint or
-  WebSocket support.
-- Generated C is returned as text and is not compiled, run, or sandboxed.
-- CORS currently allows requests from any origin. This local development
-  service should not be exposed to untrusted networks.
+- Code generation requires a separately running `llama.cpp` server with the configured model available.
+- Generation has no request timeout.
+- Generated C is compiled and executed through the WebSocket endpoint, subject to the documented resource limits.
+- The execution service is not a complete security sandbox. Additional OS-level isolation is required before running untrusted programs.
+- The current CORS configuration permits requests from any origin and is intended only for local development.
+
