@@ -116,7 +116,8 @@ function isUp(url, timeoutMs = 1500) {
 
 async function waitFor(url, seconds) {
   for (let i = 0; i < seconds * 4; i += 1) {
-    if (await isUp(url, 1000)) return true;
+    // 3s: on Windows a refused connection takes about 2s to fail.
+    if (await isUp(url, 3000)) return true;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   return false;
@@ -310,7 +311,8 @@ async function main() {
     cwd: ROOT,
     env: { ...process.env, PYTHONUTF8: '1', PYTHONUNBUFFERED: '1' },
   });
-  if (!(await waitFor(`http://127.0.0.1:${BACKEND_PORT}/health`, 60))) {
+  // "/" answers at once; "/health" also checks the AI model, which can be slow.
+  if (!(await waitFor(`http://127.0.0.1:${BACKEND_PORT}/`, 60))) {
     if (!stopping) {
       console.log(`\n  ${red(SYMBOLS.fail)} The backend did not start (see the messages above).`);
       stopAll(1);
