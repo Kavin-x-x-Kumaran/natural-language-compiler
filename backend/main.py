@@ -34,7 +34,9 @@ MODEL = "Qwen3-4B-Q4_K_M.gguf"
 OLLAMA_PORT = int(os.environ.get("OLLAMA_PORT", "11434"))
 OLLAMA_URL = f"http://127.0.0.1:{OLLAMA_PORT}"
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "").strip()
-# Which installed Ollama model to use, best first; otherwise the first one.
+# Which installed Ollama model to use, best first. Only Qwen models are used:
+# prefix.txt is written for Qwen, and other models (e.g. Llama) answer
+# ordinary programs with refusals like "I can't help with that".
 OLLAMA_PREFERENCE = ("qwen3:4b", "qwen2.5-coder", "qwen3", "qwen2.5", "qwen")
 # prefix.txt is about 2,000 tokens; Ollama's default window can be smaller,
 # and Ollama silently drops the start of a prompt that does not fit.
@@ -107,6 +109,28 @@ app.add_middleware(
 )
 
 
+async def _llama_model_name(client: httpx.AsyncClient) -> str:
+    """The model llama-server has loaded (shown at startup), or the default name."""
+    try:
+        models = (await client.get(f"http://127.0.0.1:{LLAMA_PORT}/v1/models")).json()["data"]
+        return str(models[0]["id"]) or MODEL
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
+        return MODEL
+
+
+async def _ollama_model_names() -> list[str]:
+    try:
+        async with httpx.AsyncClient(timeout=1.5, trust_env=False) as client:
+            tags = (await client.get(f"{OLLAMA_URL}/api/tags")).json()
+        return [m["name"] for m in tags.get("models") or []]
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
+        return []
+
+
+# Every valid answer is a whole C program, so it has a main() function.
+_C_PROGRAM = re.compile(r"\bmain\s*\(")
+
+
 def _pick_ollama_model(names: list[str]) -> str | None:
     if OLLAMA_MODEL:
         return OLLAMA_MODEL
@@ -114,7 +138,7 @@ def _pick_ollama_model(names: list[str]) -> str | None:
         for name in names:
             if name.startswith(wanted):
                 return name
-    return names[0] if names else None
+    return None
 
 
 async def find_model_server() -> tuple[str, str, bool] | None:
@@ -127,7 +151,7 @@ async def find_model_server() -> tuple[str, str, bool] | None:
         try:
             status = (await client.get(LLAMA_HEALTH_URL)).status_code
             if status in (200, 503):  # 503: running, model still loading
-                return ("llama-server", MODEL, status == 200)
+                return ("llama-server", await _llama_model_name(client), status == 200)
         except httpx.HTTPError:
             pass
         try:
@@ -154,6 +178,14 @@ async def compile_nl(lines: list[NLLine]):
 
     server = await find_model_server()
     if server is None:
+        others = await _ollama_model_names()
+        if others:
+            message = (
+                f"Ollama is running, but it has no Qwen model (it has: {', '.join(others)}). "
+                "This app only uses Qwen. Run: ollama pull qwen3:4b  "
+                "(or install llama.cpp, see the README), then press Run again."
+            )
+            return JSONResponse(status_code=503, content={"error": message})
         return JSONResponse(status_code=503, content={"error": MODEL_DOWN_MESSAGE})
     kind, model, _ = server
     if kind == "Ollama":
@@ -219,7 +251,16 @@ async def compile_nl(lines: list[NLLine]):
 
     # The frontend treats a value starting with "ERROR:" (prefix.txt's
     # rejection format) as an error, not as code.
-    return {"code": clean_model_output(content)}
+    code = clean_model_output(content)
+    if not code.startswith("ERROR:") and not _C_PROGRAM.search(code):
+        # Plain text (e.g. "I can't help with that...") must never land in
+        # the C editor.
+        snippet = " ".join(code.split())[:200]
+        code = (
+            f"ERROR: NOT_C_CODE | The AI model ({kind}, {model}) replied with text "
+            f"instead of a C program: \"{snippet}\""
+        )
+    return {"code": code}
 
 
 @app.get("/health")

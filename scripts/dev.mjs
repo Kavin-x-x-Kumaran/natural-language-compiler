@@ -357,8 +357,15 @@ async function checkModel() {
     return llamaServer;
   }
   const models = await ollamaModels();
+  const qwen = (models || []).filter((name) => name.toLowerCase().startsWith('qwen'));
+  if (qwen.length) {
+    ok(`AI model: Ollama is running (Qwen models: ${qwen.join(', ')})`);
+    return null;
+  }
   if (models && models.length) {
-    ok(`AI model: Ollama is running (models: ${models.join(', ')})`);
+    warn(`Ollama is running but has no Qwen model (it has: ${models.join(', ')}).`);
+    hint('This app only uses Qwen. Install llama.cpp (winget install llama.cpp), or run:');
+    hint('  ollama pull qwen3:4b');
     return null;
   }
   warn('llama.cpp was not found, so "Run" (English ' + SYMBOLS.arrow + ' C) will not work yet.');
@@ -526,13 +533,18 @@ function getJson(url) {
 async function testModel() {
   if (process.env.NLC_SKIP_MODEL_TEST) return;
   const deadline = Date.now() + 30 * 60 * 1000;
+  let health;
   for (;;) {
     if (stopping || Date.now() > deadline) return;
-    const health = await getJson(`http://127.0.0.1:${BACKEND_PORT}/health`);
+    health = await getJson(`http://127.0.0.1:${BACKEND_PORT}/health`);
     if (health && health.model === 'ok') break;
     await new Promise((resolve) => setTimeout(resolve, 3000));
   }
-  hint('Testing the AI model with the "adder" example (this also warms it up)...');
+  const server = health.model_server || 'unknown';
+  hint(`Testing the AI model (${server}) with the "adder" example (this also warms it up)...`);
+  if (!/qwen/i.test(server)) {
+    warn(`This does not look like a Qwen model (${server}). The app is built for Qwen3 4B; other models may refuse ordinary programs.`);
+  }
   const started = Date.now();
   const result = await postJson(
     `http://127.0.0.1:${BACKEND_PORT}/compile`,
@@ -547,7 +559,7 @@ async function testModel() {
   const seconds = Math.round((Date.now() - started) / 1000);
   const code = result.body && typeof result.body.code === 'string' ? result.body.code : '';
   if (result.status === 200 && code.includes('main') && !code.startsWith('ERROR:')) {
-    console.log(`\n  ${green(SYMBOLS.ok)} ${bold('AI model test passed')}: it wrote C code for the adder example in ${seconds}s.\n`);
+    console.log(`\n  ${green(SYMBOLS.ok)} ${bold('AI model test passed')} (${server}): it wrote C code for the adder example in ${seconds}s.\n`);
     return;
   }
   const what = result.error
@@ -555,7 +567,7 @@ async function testModel() {
     : code.startsWith('ERROR:')
       ? `the model refused the adder example: ${code.trim()}`
       : (result.body && result.body.error) || `unexpected answer (HTTP ${result.status})`;
-  console.log(`\n  ${yellow('!')} AI model test failed: ${what}`);
+  console.log(`\n  ${yellow('!')} AI model test failed (${server}): ${what}`);
   hint('"Run" may not work properly. Check llama-server.log, and that the model is Qwen3 4B.\n');
 }
 
