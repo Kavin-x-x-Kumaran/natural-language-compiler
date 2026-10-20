@@ -31,13 +31,13 @@ Nothing needs configuring: every setting has a default. To change one, copy `bac
 
 ### 4. Start the model server
 
-Install [llama.cpp](https://github.com/ggml-org/llama.cpp) (on Windows: `winget install llama.cpp`), then run:
+`npm run dev` does this for you when llama.cpp is installed. To run it by hand, install [llama.cpp](https://github.com/ggml-org/llama.cpp) (on Windows: `winget install llama.cpp`), then run:
 
 ```bash
-llama-server -hf Qwen/Qwen3-4B-GGUF:Q4_K_M --port 8080 -c 8192 --jinja
+llama-server -hf Qwen/Qwen3-4B-GGUF:Q4_K_M --port 8080 -c 8192 -np 1 --jinja
 ```
 
-The first run downloads the Qwen3-4B model (about 2.5 GB). `-c 8192` leaves room for the roughly 2,000-token prompt, and `--jinja` lets the backend turn off Qwen3's slow "thinking" mode. The backend talks to `http://127.0.0.1:8080/v1/chat/completions`.
+The first run downloads the Qwen3-4B model (about 2.5 GB). `-c 8192` leaves room for the roughly 2,000-token prompt, `-np 1` gives that whole context to one request (newer builds otherwise split it, which cuts answers off), and `--jinja` lets the backend turn off Qwen3's slow "thinking" mode. The backend talks to `http://127.0.0.1:8080/v1/chat/completions`.
 
 ### 5. Start the backend
 

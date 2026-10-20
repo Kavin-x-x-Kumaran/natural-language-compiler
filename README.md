@@ -31,28 +31,39 @@ After installing, **close and reopen VS Code** so it sees the new programs.
 ## 2. Run it
 
 1. In VS Code: **File → Open Folder…** and choose this project folder.
-2. **Terminal → New Terminal**, and start the AI model:
-
-   ```bash
-   llama-server -hf Qwen/Qwen3-4B-GGUF:Q4_K_M --port 8080 -c 8192 --jinja
-   ```
-
-   The first time, this downloads the model (about 2.5 GB). Leave this
-   terminal open.
-
-   **Already have [Ollama](https://ollama.com) with a Qwen model** (check with
-   `ollama list`)? Skip this step: when llama-server is not running, the app
-   uses Ollama automatically (it prefers `qwen3:4b`, then other Qwen models).
-3. Open a **second** terminal (the **+** button in the terminal panel) and run:
+2. **Terminal → New Terminal**, and run:
 
    ```bash
    npm run dev
    ```
 
-   The first run sets everything up (a few minutes). Your browser then opens
-   **http://localhost:5173**.
+   That one command starts everything: the AI model (llama-server with
+   Qwen3 4B), the backend and the web page. Your browser opens
+   **http://localhost:5173**, and the terminal prints **"The AI model is
+   ready"** when **Run** can be used.
 
-To stop the app, press **Ctrl+C** in that terminal.
+   The first time takes longer: it sets up Python and the web page (a few
+   minutes) and downloads the AI model (about 2.5 GB).
+
+To stop everything, press **Ctrl+C** in that terminal.
+
+<details>
+<summary>Other ways to run the AI model</summary>
+
+- **Your own model file:** put `LLAMA_MODEL_FILE=C:/path/to/model.gguf` in
+  `backend/.env` (copy it from `backend/.env.example`).
+- **Start llama-server yourself** (e.g. with extra options): run it in another
+  terminal before `npm run dev`, which then uses it as it is:
+
+  ```bash
+  llama-server -hf Qwen/Qwen3-4B-GGUF:Q4_K_M --port 8080 -c 8192 -np 1 --jinja
+  ```
+
+- **[Ollama](https://ollama.com):** if llama.cpp is not installed but Ollama
+  has a Qwen model (`ollama list`), the app uses Ollama instead (it prefers
+  `qwen3:4b`).
+
+</details>
 
 ## 3. Use it
 
@@ -67,7 +78,7 @@ The chip in the top-right corner shows what is working:
 | chip | meaning |
 | --- | --- |
 | **Ready** (green) | everything is running |
-| **AI model not running** (amber) | Compile & Run works, but **Run** needs llama-server (step 2.2) or Ollama |
+| **AI model not running** (amber) | Compile & Run works. **Run** needs the AI model: wait for "The AI model is ready" in the terminal, or install llama.cpp (step 1) |
 | **Backend not running** (red) | start the app with `npm run dev` |
 
 ## Troubleshooting
@@ -77,8 +88,9 @@ The chip in the top-right corner shows what is working:
 | `npm.ps1 cannot be loaded … running scripts is disabled` | Open a new terminal: this project sets VS Code to use Command Prompt, which avoids it. Or run once in PowerShell: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 | `Python 3.11 or newer was not found` | Install Python (step 1), tick "Add python.exe to PATH", then reopen VS Code |
 | `gcc (the C compiler) was not found` | Install gcc with MSYS2 (step 1), then restart `npm run dev` |
-| `The AI model is not running` | Start llama-server (step 2.2) and press **Run** again |
-| `The AI model is still loading` | Wait a few seconds after starting llama-server, then press **Run** again |
+| `The AI model is not running` | Wait for "The AI model is ready" in the `npm run dev` terminal. If it says the model stopped, see `llama-server.log` |
+| `The AI model is still loading` | Wait for "The AI model is ready" in the terminal, then press **Run** again |
+| `The answer was cut off` | You started llama-server yourself without `-np 1`: use the command under "Other ways to run the AI model" |
 | `Port 8000 is already in use` | The app is already running in another terminal; use that one or stop it with Ctrl+C |
 | `llama-server` is not recognized | Reopen VS Code after `winget install`, or download a Windows build from [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) |
 | **Run** is slow | Normal on a laptop CPU: generation can take 30–60 seconds |
@@ -89,7 +101,7 @@ The chip in the top-right corner shows what is working:
 | --- | --- |
 | `frontend/` | React + Vite web UI. See [`frontend/README.md`](frontend/README.md) |
 | `backend/` | FastAPI service: talks to the model and compiles/runs C with gcc. See [`backend/README.md`](backend/README.md) |
-| `scripts/dev.mjs` | what `npm run dev` runs: sets up Python, starts backend + frontend |
+| `scripts/dev.mjs` | what `npm run dev` runs: sets up Python, starts the AI model, backend and frontend |
 | `requirements.txt` | the backend's Python packages |
 
 **Safety note:** the app compiles and runs the generated C on your computer,

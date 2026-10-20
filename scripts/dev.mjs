@@ -3,15 +3,15 @@
  * One command to run the whole app:   npm run dev
  *
  * First run: creates a Python environment (.venv) and installs the backend's
- * packages, then installs the frontend's packages. Every run: checks for gcc
- * and the AI model, starts the backend and the frontend, and opens the
- * browser. Ctrl+C stops everything.
+ * packages, then installs the frontend's packages. Every run: checks for gcc,
+ * starts the AI model (llama-server) if llama.cpp is installed, starts the
+ * backend and the frontend, and opens the browser. Ctrl+C stops everything.
  *
  * Uses only Node's built-in modules, so it works straight after cloning.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
@@ -34,6 +34,24 @@ const LLAMA_PORT = Number(backendEnv.LLAMA_PORT || 8080);
 const FRONTEND_PORT = 5173;
 const OLLAMA_PORT = Number(backendEnv.OLLAMA_PORT || 11434);
 const APP_URL = `http://localhost:${FRONTEND_PORT}`;
+
+// The AI model llama-server runs. Set LLAMA_MODEL_FILE in backend/.env to use
+// a .gguf file you already have instead of downloading this one.
+const LLAMA_HF_MODEL = 'Qwen/Qwen3-4B-GGUF:Q4_K_M';
+const LLAMA_MODEL_FILE = process.env.LLAMA_MODEL_FILE || backendEnv.LLAMA_MODEL_FILE || '';
+const LLAMA_AUTOSTART = !/^(0|false|no|off)$/i.test(
+  process.env.LLAMA_AUTOSTART || backendEnv.LLAMA_AUTOSTART || 'true'
+);
+const LLAMA_LOG = path.join(ROOT, 'llama-server.log');
+// -c 8192: the prompt alone is about 2,000 tokens. -np 1: one request at a
+// time, so it gets the whole context (newer builds split it across slots).
+// --jinja: lets the backend turn off Qwen3's slow "thinking".
+const LLAMA_ARGS = [
+  ...(LLAMA_MODEL_FILE ? ['-m', LLAMA_MODEL_FILE] : ['-hf', LLAMA_HF_MODEL]),
+  '--host', '127.0.0.1', '--port', String(LLAMA_PORT),
+  '-c', '8192', '-np', '1', '--jinja',
+];
+const LLAMA_COMMAND_TEXT = `llama-server ${LLAMA_ARGS.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(' ')}`;
 
 // ---------------------------------------------------------------- output
 
@@ -256,27 +274,51 @@ function ollamaModels() {
   });
 }
 
+/** Full path of llama-server if llama.cpp is installed, else null. */
+function findLlamaServer() {
+  const explicit = process.env.LLAMA_SERVER || backendEnv.LLAMA_SERVER;
+  if (explicit) return existsSync(explicit) ? explicit : null;
+  const name = IS_WINDOWS ? 'llama-server.exe' : 'llama-server';
+  const folders = (process.env.PATH || process.env.Path || '').split(path.delimiter).filter(Boolean);
+  if (IS_WINDOWS && process.env.LOCALAPPDATA) {
+    // winget's shortcut folder, in case PATH has not been refreshed yet.
+    folders.push(path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links'));
+  }
+  for (const folder of folders) {
+    const candidate = path.join(folder.replace(/^"|"$/g, ''), name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Decide where "Run" gets its AI model from. Returns the llama-server path
+ * when it should be started by this script, else null.
+ */
 async function checkModel() {
   if (await isUp(`http://127.0.0.1:${LLAMA_PORT}/health`, 3000)) {
-    ok(`AI model server (llama-server) is running on port ${LLAMA_PORT}`);
-    return;
+    ok(`AI model server (llama-server) is already running on port ${LLAMA_PORT}`);
+    return null;
+  }
+  if (!(await portIsFree(LLAMA_PORT))) {
+    ok(`Something is already using port ${LLAMA_PORT}; assuming it is llama-server still loading`);
+    return null;
+  }
+  const llamaServer = LLAMA_AUTOSTART ? findLlamaServer() : null;
+  if (llamaServer) {
+    ok(`llama.cpp found; the AI model will start with the app (${LLAMA_MODEL_FILE || 'Qwen3 4B'})`);
+    return llamaServer;
   }
   const models = await ollamaModels();
   if (models && models.length) {
     ok(`AI model: Ollama is running (models: ${models.join(', ')})`);
-    return;
+    return null;
   }
-  if (models) {
-    warn('Ollama is running but has no models.');
-    hint(`The app will open, but "Run" (English ${SYMBOLS.arrow} C) needs one. Run once:`);
-    hint('  ollama pull qwen3:4b');
-    return;
-  }
-  warn('No AI model is running (neither Ollama nor llama-server).');
-  hint(`The app will open, but "Run" (English ${SYMBOLS.arrow} C) needs one. Either open Ollama, or in a`);
-  hint('second terminal run:');
-  hint(`  llama-server -hf Qwen/Qwen3-4B-GGUF:Q4_K_M --port ${LLAMA_PORT} -c 8192 --jinja`);
-  hint('See the README for how to install them.');
+  warn('llama.cpp was not found, so "Run" (English ' + SYMBOLS.arrow + ' C) will not work yet.');
+  hint(IS_WINDOWS ? 'Install it with:  winget install llama.cpp' : 'Install llama.cpp (see the README).');
+  hint('Then close and reopen VS Code, and run: npm run dev');
+  hint('Compile & Run works without it.');
+  return null;
 }
 
 async function checkPorts() {
@@ -325,6 +367,65 @@ function start(name, command, args, options) {
   return child;
 }
 
+function lastLines(file, count) {
+  try {
+    return readFileSync(file, 'utf8').split(/\r?\n/).filter((l) => l.trim()).slice(-count);
+  } catch {
+    return [];
+  }
+}
+
+/** Start llama-server in the background; its (long) output goes to a log file. */
+function startLlamaServer(llamaServer) {
+  step(`Starting the AI model (llama-server on port ${LLAMA_PORT})`);
+  if (!LLAMA_MODEL_FILE) {
+    hint('The first time, this downloads the Qwen3 4B model (about 2.5 GB).');
+  }
+  hint('The app opens straight away; a line appears here when the model is ready.');
+  hint(`llama-server's own messages go to ${path.relative(ROOT, LLAMA_LOG)}`);
+
+  const log = openSync(LLAMA_LOG, 'w');
+  const child = spawn(llamaServer, LLAMA_ARGS, { stdio: ['ignore', log, log], windowsHide: true });
+  closeSync(log);
+  children.push(child);
+
+  let ended = false;
+  const report = (why) => {
+    if (ended || stopping) return;
+    ended = true;
+    console.log(`\n  ${red(SYMBOLS.fail)} The AI model server ${why}. "Run" will not work; Compile & Run still does.`);
+    const tail = lastLines(LLAMA_LOG, 8);
+    if (tail.length) {
+      hint(`Last lines of ${path.relative(ROOT, LLAMA_LOG)}:`);
+      for (const line of tail) hint(`  ${line}`);
+    }
+    hint(`To try it by hand, run in another terminal:  ${LLAMA_COMMAND_TEXT}`);
+    console.log('');
+  };
+  child.on('error', (error) => report(`could not start (${error.message})`));
+  child.on('exit', (code) => report(`stopped (exit code ${code})`));
+
+  // Tell the user when the model is ready, and that it is still working.
+  (async () => {
+    const started = Date.now();
+    let lastNote = started;
+    while (!ended && !stopping) {
+      if (await isUp(`http://127.0.0.1:${LLAMA_PORT}/health`, 3000)) {
+        if (!stopping) {
+          console.log(`\n  ${green(SYMBOLS.ok)} ${bold('The AI model is ready.')} Press "Run" in the browser.\n`);
+        }
+        return;
+      }
+      if (Date.now() - lastNote >= 60000) {
+        lastNote = Date.now();
+        const minutes = Math.round((lastNote - started) / 60000);
+        hint(`... the AI model is still loading (${minutes} min so far; the first start downloads 2.5 GB)`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  })();
+}
+
 async function main() {
   console.log(bold(`\nNatural Language ${SYMBOLS.arrow} C compiler`));
 
@@ -333,11 +434,13 @@ async function main() {
   setupPython();
   setupFrontend();
   checkGcc();
-  await checkModel();
+  const llamaServer = await checkModel();
   await checkPorts();
 
   process.on('SIGINT', () => stopAll(0));
   process.on('SIGTERM', () => stopAll(0));
+
+  if (llamaServer) startLlamaServer(llamaServer);
 
   step(`Starting the backend on port ${BACKEND_PORT}`);
   start('backend', VENV_PYTHON, [BACKEND_MAIN], {

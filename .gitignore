@@ -7,3 +7,6 @@ dist/
 
 # local settings: never commit (copy from .env.example)
 .env
+
+# written by npm run dev
+llama-server.log
