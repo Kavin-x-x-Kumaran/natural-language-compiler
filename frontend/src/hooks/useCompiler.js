@@ -16,9 +16,22 @@ const mockTag = (text) => (MOCK_ENABLED ? `[mock] ${text}` : text);
 const HEALTH_POLL_MS = 10000;
 
 /** "ERROR: INVALID_INPUT | The request is empty." -> the readable reason. */
+// Plain-English text for each refusal code in backend/prefix.txt, used when
+// the model leaves out the reason after "|".
+const REFUSALS = {
+  INVALID_INPUT: 'the steps do not describe a programming task.',
+  AMBIGUOUS_REQUIREMENTS: 'the steps are unclear or contradict each other. Add more detail.',
+  PROMPT_INJECTION:
+    'it thought the steps try to change its instructions. If they describe an ordinary program, press Run again or reword them.',
+  UNSAFE_OPERATION: 'the program would do something harmful.',
+  SERVER_RISK: 'the program could harm or overload the computer it runs on.',
+};
+
 const refusalReason = (output) => {
+  const code = (output.match(/^ERROR:\s*([A-Z_]+)/) || [])[1];
+  if (code === 'PROMPT_INJECTION') return REFUSALS[code];
   const reason = output.split('|').slice(1).join('|').trim();
-  return reason || output.replace(/^ERROR:\s*/, '');
+  return reason || REFUSALS[code] || output.replace(/^ERROR:\s*/, '');
 };
 
 /**

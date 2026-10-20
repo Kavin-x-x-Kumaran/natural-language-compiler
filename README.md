@@ -16,21 +16,68 @@ with gcc and run, with an interactive terminal for its input and output.
 
 ## 1. Install these once
 
-| what | why | how (Windows) |
-| --- | --- | --- |
-| **Node.js** 18 or newer | runs the app | [nodejs.org](https://nodejs.org) → the LTS installer |
-| **Python** 3.11 or newer | runs the backend | [python.org/downloads](https://www.python.org/downloads/). In the installer, tick **"Add python.exe to PATH"** |
-| **gcc** | compiles the C code | Install [MSYS2](https://www.msys2.org/), open the **"MSYS2 UCRT64"** window and run `pacman -S mingw-w64-ucrt-x86_64-gcc` |
-| **llama.cpp** | runs the AI model | In a terminal: `winget install llama.cpp` |
+**Windows:** open **PowerShell** and run these one at a time (each takes a
+minute or two; say **Yes** if Windows asks for permission):
 
-On Linux or macOS, install the same four with your package manager
-(e.g. `sudo apt install nodejs npm python3 python3-venv gcc`, plus llama.cpp).
+```powershell
+winget install OpenJS.NodeJS.LTS
+winget install Python.Python.3.12
+winget install Git.Git
+winget install llama.cpp
+winget install MSYS2.MSYS2
+C:\msys64\usr\bin\bash.exe -lc "pacman -Sy --noconfirm mingw-w64-ucrt-x86_64-gcc"
+```
 
-After installing, **close and reopen VS Code** so it sees the new programs.
+| program | why the app needs it |
+| --- | --- |
+| **Node.js** (LTS) | runs `npm run dev` and the web page |
+| **Python** 3.11 or newer | runs the backend |
+| **Git** | downloads the project |
+| **llama.cpp** | runs the AI model (Qwen3 4B) |
+| **MSYS2** + the last line | installs **gcc**, which compiles the C code. The app finds it in `C:\msys64` by itself |
 
-## 2. Run it
+Then **close and reopen PowerShell / VS Code** so it sees the new programs,
+and check:
 
-1. In VS Code: **File → Open Folder…** and choose this project folder.
+```powershell
+node --version
+py --version
+git --version
+llama-server --version
+```
+
+Each should print a version number. If one says "not recognized", install it
+again or restart the computer.
+
+**Linux / macOS:** install the same programs with your package manager:
+`brew install node python git llama.cpp` on macOS (gcc comes with
+`xcode-select --install`), or `sudo apt install nodejs npm python3 python3-venv gcc git`
+on Ubuntu plus [llama.cpp](https://github.com/ggml-org/llama.cpp).
+
+## 2. Get the project
+
+```powershell
+git clone -b backend https://github.com/Kavin-x-x-Kumaran/natural-language-compiler
+cd natural-language-compiler
+```
+
+`-b backend` matters: the working app is on the **`backend`** branch.
+
+**Already have an older copy?** Update it instead (inside its folder):
+
+```powershell
+git fetch origin
+git switch backend
+git pull origin backend
+```
+
+`git branch --show-current` should print `backend`. If `npm run dev` says
+**Missing script: "dev"**, you are still on the old `main` branch.
+
+## 3. Run it
+
+1. In VS Code: **File → Open Folder…** and choose the `natural-language-compiler`
+   folder.
 2. **Terminal → New Terminal**, and run:
 
    ```bash
@@ -65,7 +112,7 @@ To stop everything, press **Ctrl+C** in that terminal.
 
 </details>
 
-## 3. Use it
+## 4. Use it
 
 1. Write steps in **Natural language** (or use the two example tabs).
 2. Press **Run**. The C code appears under **Generated C source**.
@@ -86,8 +133,9 @@ The chip in the top-right corner shows what is working:
 | you see | do this |
 | --- | --- |
 | `npm.ps1 cannot be loaded … running scripts is disabled` | Open a new terminal: this project sets VS Code to use Command Prompt, which avoids it. Or run once in PowerShell: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
-| `Python 3.11 or newer was not found` | Install Python (step 1), tick "Add python.exe to PATH", then reopen VS Code |
-| `gcc (the C compiler) was not found` | Install gcc with MSYS2 (step 1), then restart `npm run dev` |
+| `Python 3.11 or newer was not found` | Install Python (step 1), then close and reopen VS Code |
+| `gcc (the C compiler) was not found` | Run the MSYS2 lines from step 1, then restart `npm run dev` |
+| `Missing script: "dev"` | You are on the old `main` branch: see "Already have an older copy?" in step 2 |
 | `The AI model is not running` | Wait for "The AI model is ready" in the `npm run dev` terminal. If it says the model stopped, see `llama-server.log` |
 | `The AI model is still loading` | Wait for "The AI model is ready" in the terminal, then press **Run** again |
 | `The answer was cut off` | You started llama-server yourself without `-np 1`: use the command under "Other ways to run the AI model" |

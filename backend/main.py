@@ -143,7 +143,14 @@ async def find_model_server() -> tuple[str, str, bool] | None:
 @app.post(COMPILE_ROUTE)
 async def compile_nl(lines: list[NLLine]):
     nl_code = "\n".join(f"{l.line}. {l.text}" for l in sorted(lines, key=lambda l: l.line))
-    messages = [{"role": "user", "content": PREFIX + DELIMITER + nl_code}]
+    # prefix.txt is the system prompt: trusted rules. Only the user's steps go
+    # in the user message, after the delimiter. Sending both as one user
+    # message made small models treat the rules themselves as untrusted input
+    # and answer ERROR: PROMPT_INJECTION for ordinary programs.
+    messages = [
+        {"role": "system", "content": PREFIX},
+        {"role": "user", "content": DELIMITER.lstrip("\n") + nl_code},
+    ]
 
     server = await find_model_server()
     if server is None:
