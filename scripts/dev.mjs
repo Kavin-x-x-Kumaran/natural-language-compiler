@@ -15,6 +15,7 @@ import { closeSync, existsSync, openSync, readFileSync, writeFileSync } from 'no
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
+import readline from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -45,7 +46,7 @@ const LLAMA_AUTOSTART = !/^(0|false|no|off)$/i.test(
 const LLAMA_LOG = path.join(ROOT, 'llama-server.log');
 // -c 8192: the prompt alone is about 2,000 tokens. -np 1: one request at a
 // time, so it gets the whole context (newer builds split it across slots).
-// --jinja: lets the backend turn off Qwen3's slow "thinking".
+// --jinja: Qwen3's chat template; keeps its "thinking" out of the answer.
 const LLAMA_ARGS = [
   ...(LLAMA_MODEL_FILE ? ['-m', LLAMA_MODEL_FILE] : ['-hf', LLAMA_HF_MODEL]),
   '--host', '127.0.0.1', '--port', String(LLAMA_PORT),
@@ -227,7 +228,8 @@ function setupFrontend() {
   ok('Frontend packages ready');
 }
 
-function checkGcc() {
+/** True if gcc works (PATH, NLC_GCC, or the usual Windows folders). */
+function findGcc() {
   const explicit = process.env.NLC_GCC || backendEnv.NLC_GCC;
   const guesses = IS_WINDOWS
     ? [
@@ -240,15 +242,60 @@ function checkGcc() {
   const candidates = [explicit, 'gcc', ...guesses.filter((g) => existsSync(g))].filter(Boolean);
   for (const gcc of candidates) {
     const result = spawnSync(gcc, ['--version'], { encoding: 'utf8', windowsHide: true });
-    if (result.status === 0) {
-      ok(`gcc found (${result.stdout.split(/\r?\n/)[0].trim()})`);
-      return;
-    }
+    if (result.status === 0) return result.stdout.split(/\r?\n/)[0].trim();
+  }
+  return null;
+}
+
+const MSYS2_BASH = 'C:\\msys64\\usr\\bin\\bash.exe';
+const GCC_PACKAGE_COMMAND = 'pacman -Sy --noconfirm mingw-w64-ucrt-x86_64-gcc';
+
+async function askYesNo(question) {
+  if (!process.stdin.isTTY) return false;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question(`    ${question} [Y/n] `)).trim().toLowerCase();
+    return answer === '' || answer === 'y' || answer === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+/** Windows only: install MSYS2 + gcc with winget, after asking. */
+async function offerGccInstall() {
+  if (!IS_WINDOWS) return false;
+  const haveWinget = spawnSync('winget', ['--version'], { windowsHide: true }).status === 0;
+  if (!haveWinget && !existsSync(MSYS2_BASH)) return false;
+  if (!(await askYesNo('Install gcc now? (MSYS2 + gcc, about 5 minutes, needs internet)'))) return false;
+  if (!existsSync(MSYS2_BASH)) {
+    step('Installing MSYS2 (winget)');
+    run('winget', ['install', '--id', 'MSYS2.MSYS2', '-e', '--accept-package-agreements', '--accept-source-agreements']);
+  }
+  if (!existsSync(MSYS2_BASH)) return false;
+  step('Installing gcc (MSYS2 pacman)');
+  run(MSYS2_BASH, ['-lc', GCC_PACKAGE_COMMAND]);
+  return true;
+}
+
+async function checkGcc() {
+  let version = findGcc();
+  if (version) {
+    ok(`gcc found (${version})`);
+    return;
   }
   warn('gcc was not found, so "Compile & Run" will not work until you install it.');
+  if (await offerGccInstall()) {
+    version = findGcc();
+    if (version) {
+      ok(`gcc installed (${version})`);
+      return;
+    }
+    warn('gcc is still not found after installing.');
+  }
   if (IS_WINDOWS) {
-    hint('Install MSYS2 from https://www.msys2.org/ then, in the "MSYS2 UCRT64" window, run:');
-    hint('  pacman -S mingw-w64-ucrt-x86_64-gcc');
+    hint('Install it from PowerShell, then run npm run dev again:');
+    hint('  winget install MSYS2.MSYS2');
+    hint(`  ${MSYS2_BASH} -lc "${GCC_PACKAGE_COMMAND}"`);
   } else {
     hint('Install it with your package manager, e.g.: sudo apt install gcc');
   }
@@ -426,6 +473,92 @@ function startLlamaServer(llamaServer) {
   })();
 }
 
+/** POST JSON with node:http; resolves to { status, body } or { error }. */
+function postJson(url, data, timeoutMs) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify(data);
+    const request = http.request(
+      url,
+      { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+      (response) => {
+        let text = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { text += chunk; });
+        response.on('end', () => {
+          try {
+            resolve({ status: response.statusCode, body: JSON.parse(text) });
+          } catch {
+            resolve({ status: response.statusCode, body: {} });
+          }
+        });
+      }
+    );
+    request.setTimeout(timeoutMs, () => request.destroy(new Error('timed out')));
+    request.on('error', (error) => resolve({ error: error.message }));
+    request.end(body);
+  });
+}
+
+function getJson(url) {
+  return new Promise((resolve) => {
+    const request = http.get(url, (response) => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { text += chunk; });
+      response.on('end', () => {
+        try {
+          resolve(JSON.parse(text));
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    request.setTimeout(5000, () => request.destroy());
+    request.on('error', () => resolve(null));
+  });
+}
+
+/**
+ * Once the AI model is up, generate the adder example once through the
+ * backend: proves "Run" works end to end, and warms the model up so the
+ * first real Run is faster.
+ */
+async function testModel() {
+  if (process.env.NLC_SKIP_MODEL_TEST) return;
+  const deadline = Date.now() + 30 * 60 * 1000;
+  for (;;) {
+    if (stopping || Date.now() > deadline) return;
+    const health = await getJson(`http://127.0.0.1:${BACKEND_PORT}/health`);
+    if (health && health.model === 'ok') break;
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+  hint('Testing the AI model with the "adder" example (this also warms it up)...');
+  const started = Date.now();
+  const result = await postJson(
+    `http://127.0.0.1:${BACKEND_PORT}/compile`,
+    [
+      { line: 1, text: 'Read 2 numbers as input' },
+      { line: 2, text: 'Add them' },
+      { line: 3, text: 'Display the answer' },
+    ],
+    10 * 60 * 1000
+  );
+  if (stopping) return;
+  const seconds = Math.round((Date.now() - started) / 1000);
+  const code = result.body && typeof result.body.code === 'string' ? result.body.code : '';
+  if (result.status === 200 && code.includes('main') && !code.startsWith('ERROR:')) {
+    console.log(`\n  ${green(SYMBOLS.ok)} ${bold('AI model test passed')}: it wrote C code for the adder example in ${seconds}s.\n`);
+    return;
+  }
+  const what = result.error
+    ? `could not reach the backend (${result.error})`
+    : code.startsWith('ERROR:')
+      ? `the model refused the adder example: ${code.trim()}`
+      : (result.body && result.body.error) || `unexpected answer (HTTP ${result.status})`;
+  console.log(`\n  ${yellow('!')} AI model test failed: ${what}`);
+  hint('"Run" may not work properly. Check llama-server.log, and that the model is Qwen3 4B.\n');
+}
+
 async function main() {
   console.log(bold(`\nNatural Language ${SYMBOLS.arrow} C compiler`));
 
@@ -433,7 +566,7 @@ async function main() {
   checkNode();
   setupPython();
   setupFrontend();
-  checkGcc();
+  await checkGcc();
   const llamaServer = await checkModel();
   await checkPorts();
 
@@ -463,6 +596,7 @@ async function main() {
   if (await waitFor(APP_URL, 60)) {
     console.log(`\n  ${green(SYMBOLS.ok)} ${bold('The app is running:')} ${bold(APP_URL)}`);
     console.log('    Press Ctrl+C here to stop it.\n');
+    testModel();
   }
 }
 

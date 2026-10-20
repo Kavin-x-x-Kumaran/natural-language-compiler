@@ -87,7 +87,9 @@ git pull origin backend
    That one command starts everything: the AI model (llama-server with
    Qwen3 4B), the backend and the web page. Your browser opens
    **http://localhost:5173**, and the terminal prints **"The AI model is
-   ready"** when **Run** can be used.
+   ready"** when **Run** can be used. It then tests the model once with the
+   adder example and prints **"AI model test passed"** (this also warms the
+   model up, so your first **Run** is faster).
 
    The first time takes longer: it sets up Python and the web page (a few
    minutes) and downloads the AI model (about 2.5 GB).
@@ -138,6 +140,7 @@ The chip in the top-right corner shows what is working:
 | `Missing script: "dev"` | You are on the old `main` branch: see "Already have an older copy?" in step 2 |
 | `The AI model is not running` | Wait for "The AI model is ready" in the `npm run dev` terminal. If it says the model stopped, see `llama-server.log` |
 | `The AI model is still loading` | Wait for "The AI model is ready" in the terminal, then press **Run** again |
+| `AI model test failed` in the terminal | The model is not answering properly: check `llama-server.log`, and that it is Qwen3 4B (the default) |
 | `The answer was cut off` | You started llama-server yourself without `-np 1`: use the command under "Other ways to run the AI model" |
 | `Port 8000 is already in use` | The app is already running in another terminal; use that one or stop it with Ctrl+C |
 | `llama-server` is not recognized | Reopen VS Code after `winget install`, or download a Windows build from [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) |

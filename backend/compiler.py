@@ -246,9 +246,11 @@ async def compile_source(source: str) -> CompileResult:
         )
     except FileNotFoundError:
         hint = (
-            "Install MSYS2 from https://www.msys2.org/, then in the \"MSYS2 UCRT64\" window run: "
-            "pacman -S mingw-w64-ucrt-x86_64-gcc  (the app finds C:\\msys64 by itself; "
-            "for another location set NLC_GCC). Then restart the app."
+            "Install it from PowerShell with these two lines, then stop the app (Ctrl+C) "
+            "and run npm run dev again:\n"
+            "  winget install MSYS2.MSYS2\n"
+            "  C:\\msys64\\usr\\bin\\bash.exe -lc \"pacman -Sy --noconfirm mingw-w64-ucrt-x86_64-gcc\"\n"
+            "(npm run dev can also install it for you.)"
             if IS_WINDOWS
             else "Install it (for example: sudo apt install gcc), then restart the app."
         )

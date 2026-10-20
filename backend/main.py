@@ -143,14 +143,14 @@ async def find_model_server() -> tuple[str, str, bool] | None:
 @app.post(COMPILE_ROUTE)
 async def compile_nl(lines: list[NLLine]):
     nl_code = "\n".join(f"{l.line}. {l.text}" for l in sorted(lines, key=lambda l: l.line))
-    # prefix.txt is the system prompt: trusted rules. Only the user's steps go
-    # in the user message, after the delimiter. Sending both as one user
-    # message made small models treat the rules themselves as untrusted input
-    # and answer ERROR: PROMPT_INJECTION for ordinary programs.
-    messages = [
-        {"role": "system", "content": PREFIX},
-        {"role": "user", "content": DELIMITER.lstrip("\n") + nl_code},
-    ]
+    # Exactly the request the team tested against Qwen3 (and main's backend
+    # sends): one user message, prefix.txt + delimiter + steps, with Qwen3's
+    # "thinking" left ON. With thinking off, Qwen3-4B answers on reflex and
+    # flags ordinary programs as ERROR: PROMPT_INJECTION (prefix.txt's
+    # top-priority rule). The thinking text never reaches the editor:
+    # llama-server (--jinja) returns it separately, and clean_model_output
+    # strips any <think> block that does end up in the answer.
+    messages = [{"role": "user", "content": PREFIX + DELIMITER + nl_code}]
 
     server = await find_model_server()
     if server is None:
@@ -167,17 +167,13 @@ async def compile_nl(lines: list[NLLine]):
             "keep_alive": "1h",
         }
         if model.startswith("qwen3"):
-            payload["think"] = False  # see the llama-server note below
+            payload["think"] = True  # see above; keeps the reasoning out of "content"
     else:
         url = LLAMA_URL
         payload = {
             "model": model,
             "messages": messages,
             "temperature": TEMPERATURE,
-            # Qwen3 "thinks" before answering by default, which is slow on a
-            # laptop CPU and adds nothing here. Builds that ignore this kwarg
-            # are handled by clean_model_output.
-            "chat_template_kwargs": {"enable_thinking": False},
         }
 
     try:

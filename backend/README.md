@@ -37,7 +37,7 @@ Nothing needs configuring: every setting has a default. To change one, copy `bac
 llama-server -hf Qwen/Qwen3-4B-GGUF:Q4_K_M --port 8080 -c 8192 -np 1 --jinja
 ```
 
-The first run downloads the Qwen3-4B model (about 2.5 GB). `-c 8192` leaves room for the roughly 2,000-token prompt, `-np 1` gives that whole context to one request (newer builds otherwise split it, which cuts answers off), and `--jinja` lets the backend turn off Qwen3's slow "thinking" mode. The backend talks to `http://127.0.0.1:8080/v1/chat/completions`.
+The first run downloads the Qwen3-4B model (about 2.5 GB). `-c 8192` leaves room for the roughly 2,000-token prompt, `-np 1` gives that whole context to one request (newer builds otherwise split it, which cuts answers off), and `--jinja` uses Qwen3's own chat template, which keeps its "thinking" (needed for correct answers) out of the returned code. The backend talks to `http://127.0.0.1:8080/v1/chat/completions`.
 
 ### 5. Start the backend
 
