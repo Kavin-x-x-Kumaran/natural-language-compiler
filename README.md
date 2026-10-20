@@ -39,6 +39,10 @@ After installing, **close and reopen VS Code** so it sees the new programs.
 
    The first time, this downloads the model (about 2.5 GB). Leave this
    terminal open.
+
+   **Already have [Ollama](https://ollama.com) with a Qwen model** (check with
+   `ollama list`)? Skip this step: when llama-server is not running, the app
+   uses Ollama automatically (it prefers `qwen3:4b`, then other Qwen models).
 3. Open a **second** terminal (the **+** button in the terminal panel) and run:
 
    ```bash
@@ -63,7 +67,7 @@ The chip in the top-right corner shows what is working:
 | chip | meaning |
 | --- | --- |
 | **Ready** (green) | everything is running |
-| **AI model not running** (amber) | Compile & Run works, but **Run** needs llama-server (step 2.2) |
+| **AI model not running** (amber) | Compile & Run works, but **Run** needs llama-server (step 2.2) or Ollama |
 | **Backend not running** (red) | start the app with `npm run dev` |
 
 ## Troubleshooting

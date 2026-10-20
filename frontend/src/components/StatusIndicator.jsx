@@ -1,6 +1,6 @@
 /**
  * Header chip showing whether the app can do its job, from the backend's
- * /health check: the backend itself, and the AI model (llama-server) behind it.
+ * /health check: the backend itself, and the AI model (Ollama or llama-server) behind it.
  */
 const LABELS = {
   mock: 'Mock mode',
@@ -12,7 +12,7 @@ const LABELS = {
 
 const HINTS = {
   ready: 'Backend and AI model are running.',
-  'model-offline': 'Compile & Run works. To generate C code, start llama-server (see the README).',
+  'model-offline': 'Compile & Run works. To generate C code, open Ollama or start llama-server (see the README).',
   disconnected: 'Start the app with: npm run dev',
 };
 

@@ -30,7 +30,7 @@ const refusalReason = (output) => {
  */
 export function useCompiler({ updateTab, tabsRef }) {
   // 'checking' until the first health check answers; then 'ready',
-  // 'model-offline' (backend up, llama-server not) or 'disconnected'.
+  // 'model-offline' (backend up, no AI model) or 'disconnected'.
   const [connection, setConnection] = useState(MOCK_ENABLED ? 'mock' : 'checking');
 
   const abortControllers = useRef(new Map()); // tabId -> AbortController

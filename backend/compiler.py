@@ -120,10 +120,17 @@ RUNTIME_SHIM_NAME = "nlc_runtime.c"
 # prompt like printf("Enter a number: ") reach the user before the program
 # blocks on input; on Windows, binary mode stops the CRT turning \n into \r\n.
 RUNTIME_SHIM = r"""/* Added by the backend; not part of the generated program. */
+#ifdef _WIN32
+/* Older MinGW.org headers hide _setmode and _O_BINARY under -std=c11. */
+#undef __STRICT_ANSI__
+#endif
 #include <stdio.h>
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#ifndef _O_BINARY
+#define _O_BINARY 0x8000
+#endif
 #endif
 
 __attribute__((constructor)) static void nlc_runtime_init(void)

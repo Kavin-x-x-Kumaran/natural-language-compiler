@@ -32,6 +32,7 @@ const backendEnv = readEnvFile(path.join(ROOT, 'backend', '.env'));
 const BACKEND_PORT = Number(backendEnv.SERVER_PORT || 8000);
 const LLAMA_PORT = Number(backendEnv.LLAMA_PORT || 8080);
 const FRONTEND_PORT = 5173;
+const OLLAMA_PORT = Number(backendEnv.OLLAMA_PORT || 11434);
 const APP_URL = `http://localhost:${FRONTEND_PORT}`;
 
 // ---------------------------------------------------------------- output
@@ -235,15 +236,47 @@ function checkGcc() {
   }
 }
 
+/** Names of the models Ollama has installed, or null if Ollama is not running. */
+function ollamaModels() {
+  return new Promise((resolve) => {
+    const request = http.get(`http://127.0.0.1:${OLLAMA_PORT}/api/tags`, (response) => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { body += chunk; });
+      response.on('end', () => {
+        try {
+          resolve((JSON.parse(body).models || []).map((model) => model.name));
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    request.setTimeout(3000, () => request.destroy());
+    request.on('error', () => resolve(null));
+  });
+}
+
 async function checkModel() {
-  if (await isUp(`http://127.0.0.1:${LLAMA_PORT}/health`)) {
+  if (await isUp(`http://127.0.0.1:${LLAMA_PORT}/health`, 3000)) {
     ok(`AI model server (llama-server) is running on port ${LLAMA_PORT}`);
     return;
   }
-  warn(`The AI model server (llama-server) is not running on port ${LLAMA_PORT}.`);
-  hint(`The app will open, but "Run" (English ${SYMBOLS.arrow} C) needs it. In a second terminal, run:`);
+  const models = await ollamaModels();
+  if (models && models.length) {
+    ok(`AI model: Ollama is running (models: ${models.join(', ')})`);
+    return;
+  }
+  if (models) {
+    warn('Ollama is running but has no models.');
+    hint(`The app will open, but "Run" (English ${SYMBOLS.arrow} C) needs one. Run once:`);
+    hint('  ollama pull qwen3:4b');
+    return;
+  }
+  warn('No AI model is running (neither Ollama nor llama-server).');
+  hint(`The app will open, but "Run" (English ${SYMBOLS.arrow} C) needs one. Either open Ollama, or in a`);
+  hint('second terminal run:');
   hint(`  llama-server -hf Qwen/Qwen3-4B-GGUF:Q4_K_M --port ${LLAMA_PORT} -c 8192 --jinja`);
-  hint('See the README for how to install llama.cpp.');
+  hint('See the README for how to install them.');
 }
 
 async function checkPorts() {
