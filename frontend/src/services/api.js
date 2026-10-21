@@ -1,4 +1,4 @@
-import { API_BASE_URL, MOCK_ENABLED, generateUrl } from './endpoints.js';
+import { API_BASE_URL, MOCK_ENABLED, generateUrl, healthUrl } from './endpoints.js';
 import { REQUEST_TIMEOUT_MS } from '../utils/constants.js';
 import { mockGenerate } from './mock.js';
 
@@ -17,10 +17,11 @@ export class GenerationError extends Error {
 /**
  * Request C code for a natural-language payload.
  *
- * ANTICIPATED contract (frontend proposal, see README):
- *   POST {VITE_API_BASE_URL}/compile
+ * Backend contract (backend/main.py):
+ *   POST {API_BASE_URL}/compile
  *   body [{ "line": 1, "text": "..." }]
  *   2xx  { "code": "<string>" }
+ *   4xx/5xx { "error": "<message for the user>" }
  *
  * @param {Array<{line:number,text:string}>} payload
  * @param {{ signal?: AbortSignal }} options
@@ -57,28 +58,30 @@ export async function generateCode(payload, { signal } = {}) {
   } catch (error) {
     if (timedOut) {
       throw new GenerationError(
-        `The request timed out after ${Math.round(REQUEST_TIMEOUT_MS / 1000)} seconds.`,
-        { network: true }
+        `The AI model took longer than ${Math.round(REQUEST_TIMEOUT_MS / 60000)} minutes. ` +
+          'Try again, or use fewer lines.'
       );
     }
     if (error && error.name === 'AbortError') throw error; // caller cancelled
-    throw new GenerationError('Could not reach the backend.', { network: true });
+    throw new GenerationError(
+      `Could not reach the backend at ${API_BASE_URL}. Is it running? Start the app with: npm run dev`,
+      { network: true }
+    );
   } finally {
     clearTimeout(timer);
     if (signal) signal.removeEventListener('abort', onAbort);
   }
 
   if (!response.ok) {
-    let detail = response.statusText || '';
+    // The backend explains failures in plain language; show that as-is.
+    let message = `The backend returned an error (HTTP ${response.status}).`;
     try {
       const body = await response.json();
-      if (body && typeof body.error === 'string') detail = body.error;
+      if (body && typeof body.error === 'string') message = body.error;
     } catch {
-      /* keep statusText */
+      /* keep the generic message */
     }
-    throw new GenerationError(
-      `HTTP ${response.status}${detail ? ` — ${detail}` : ''}`
-    );
+    throw new GenerationError(message);
   }
 
   let body;
@@ -93,4 +96,23 @@ export async function generateCode(payload, { signal } = {}) {
   }
 
   return body.code;
+}
+
+/**
+ * Ask the backend whether it, and the AI model behind it, are up.
+ * @returns {Promise<'ready'|'model-offline'|'disconnected'>}
+ */
+export async function checkHealth() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  try {
+    const response = await fetch(healthUrl(), { signal: controller.signal });
+    if (!response.ok) return 'disconnected';
+    const body = await response.json();
+    return body && body.model === 'ok' ? 'ready' : 'model-offline';
+  } catch {
+    return 'disconnected';
+  } finally {
+    clearTimeout(timer);
+  }
 }

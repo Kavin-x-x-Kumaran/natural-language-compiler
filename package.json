@@ -1,0 +1,13 @@
+{
+  "name": "natural-language-compiler",
+  "private": true,
+  "description": "Type steps in plain English, get C code, then compile and run it.",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "start": "node scripts/dev.mjs",
+    "test": "npm --prefix frontend test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

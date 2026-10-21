@@ -6,8 +6,7 @@ import { mockStartRun } from './mock.js';
  * Execution adapter. Owns the socket; it never touches React state and never
  * imports React — everything reaches the UI through `onEvent` / `onClose`.
  *
- * ANTICIPATED message contract (frontend PROPOSAL, to be aligned with the
- * real backend; see README):
+ * Message contract (implemented by WS /ws/run in backend/main.py):
  *   client -> server  { type:'start', source }
  *                     { type:'stdin', data:'10 20\n' }
  *                     { type:'stop' }
@@ -16,6 +15,10 @@ import { mockStartRun } from './mock.js';
  *                     { type:'input_required' }
  *                     { type:'exit', code, phase:'compile'|'run' }
  *                     { type:'error', message }
+ *
+ * Errors this file creates itself, for a broken or unreachable connection,
+ * carry `network: true`. Errors sent by the backend (e.g. a program hitting
+ * its CPU limit) do not, so they never mark the backend as disconnected.
  */
 
 /**
@@ -30,7 +33,7 @@ export function startRun({ source, onEvent, onClose }) {
 
   if (!WS_BASE_URL) {
     setTimeout(
-      () => onEvent?.({ type: 'error', message: 'Backend URL is not configured.' }),
+      () => onEvent?.({ type: 'error', message: 'Backend URL is not configured.', network: true }),
       0
     );
     return { sendInput() {}, stop() {}, close() {} };
@@ -54,7 +57,8 @@ export function startRun({ source, onEvent, onClose }) {
       type: 'error',
       message: `Could not connect to the backend within ${Math.round(
         WS_CONNECT_TIMEOUT_MS / 1000
-      )} seconds.`,
+      )} seconds. Is it running? Start the app with: npm run dev`,
+      network: true,
     });
     try {
       socket?.close();
@@ -69,7 +73,7 @@ export function startRun({ source, onEvent, onClose }) {
   } catch {
     clearTimeout(connectTimer);
     setTimeout(() => {
-      onEvent?.({ type: 'error', message: 'Could not reach the backend.' });
+      onEvent?.({ type: 'error', message: 'Could not reach the backend. Start the app with: npm run dev', network: true });
       finish({ reason: 'constructor failed' });
     }, 0);
     return { sendInput() {}, stop() {}, close() {} };
@@ -115,7 +119,11 @@ export function startRun({ source, onEvent, onClose }) {
 
   socket.onerror = () => {
     if (closed) return;
-    onEvent?.({ type: 'error', message: 'Connection to the backend failed.' });
+    onEvent?.({
+      type: 'error',
+      message: 'Lost the connection to the backend. Is it still running?',
+      network: true,
+    });
   };
 
   socket.onclose = (event) => {
