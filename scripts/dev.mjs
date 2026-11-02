@@ -4,16 +4,17 @@
  *
  * First run: creates a Python environment (.venv) and installs the backend's
  * packages, then installs the frontend's packages. Every run: checks for gcc,
- * starts the AI model (llama-server) if llama.cpp is installed, starts the
- * backend and the frontend, and opens the browser. Ctrl+C stops everything.
+ * starts the AI model with the platform's Qwen script, starts the backend and
+ * frontend, and opens the browser. Ctrl+C stops everything.
  *
  * Uses only Node's built-in modules, so it works straight after cloning.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
@@ -36,25 +37,14 @@ const FRONTEND_PORT = 5173;
 const OLLAMA_PORT = Number(backendEnv.OLLAMA_PORT || 11434);
 const APP_URL = `http://localhost:${FRONTEND_PORT}`;
 
-// The AI model llama-server runs. Set LLAMA_MODEL_FILE in backend/.env to use
-// a .gguf file you already have instead of downloading this one.
+// Set LLAMA_MODEL_FILE in backend/.env to use a local .gguf instead of the
+// default Hugging Face model.
 const LLAMA_HF_MODEL = 'Qwen/Qwen3-4B-GGUF:Q4_K_M';
 const LLAMA_MODEL_FILE = process.env.LLAMA_MODEL_FILE || backendEnv.LLAMA_MODEL_FILE || '';
-const QWEN_START_SCRIPT = 'C:\\llama.cpp\\start-qwen.ps1';
+const QWEN_START_SCRIPT = path.join(ROOT, 'scripts', IS_WINDOWS ? 'start-qwen.ps1' : 'start-qwen.sh');
 const LLAMA_AUTOSTART = !/^(0|false|no|off)$/i.test(
   process.env.LLAMA_AUTOSTART || backendEnv.LLAMA_AUTOSTART || 'true'
 );
-const LLAMA_LOG = path.join(ROOT, 'llama-server.log');
-// -c 8192: the prompt alone is about 2,000 tokens. -np 1: one request at a
-// time, so it gets the whole context (newer builds split it across slots).
-// --jinja: Qwen3's chat template; keeps its "thinking" out of the answer.
-const LLAMA_ARGS = [
-  ...(LLAMA_MODEL_FILE ? ['-m', LLAMA_MODEL_FILE] : ['-hf', LLAMA_HF_MODEL]),
-  '--host', '127.0.0.1', '--port', String(LLAMA_PORT),
-  '-c', '8192', '-np', '1', '--jinja',
-];
-const LLAMA_COMMAND_TEXT = `llama-server ${LLAMA_ARGS.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(' ')}`;
-
 // ---------------------------------------------------------------- output
 
 const color = (code) => (text) => (process.stdout.isTTY ? `\x1b[${code}m${text}\x1b[0m` : text);
@@ -322,19 +312,22 @@ function ollamaModels() {
   });
 }
 
-/** Full path of llama-server if llama.cpp is installed, else null. */
-function findLlamaServer() {
-  if (IS_WINDOWS) return existsSync(QWEN_START_SCRIPT) ? QWEN_START_SCRIPT : null;
+/** Full path of the platform's Qwen startup script, or null if it is missing. */
+function findQwenStartScript() {
+  if (!existsSync(QWEN_START_SCRIPT)) return null;
+  if (IS_WINDOWS) return QWEN_START_SCRIPT;
 
-  const explicit = process.env.LLAMA_SERVER || backendEnv.LLAMA_SERVER;
-  if (explicit) return existsSync(explicit) ? explicit : null;
-  const name = 'llama-server';
-  const folders = (process.env.PATH || process.env.Path || '').split(path.delimiter).filter(Boolean);
-  for (const folder of folders) {
-    const candidate = path.join(folder.replace(/^"|"$/g, ''), name);
-    if (existsSync(candidate)) return candidate;
-  }
-  return null;
+  const explicitServer = process.env.LLAMA_SERVER || backendEnv.LLAMA_SERVER;
+  if (explicitServer) return existsSync(explicitServer) ? QWEN_START_SCRIPT : null;
+
+  const llamaDir = process.env.LLAMA_DIR || backendEnv.LLAMA_DIR || path.join(homedir(), 'llama.cpp');
+  const candidates = [
+    path.join(llamaDir, 'build', 'bin', 'llama-server'),
+    path.join(llamaDir, 'build', 'bin', 'Release', 'llama-server'),
+    ...(process.env.PATH || '').split(path.delimiter).filter(Boolean)
+      .map((folder) => path.join(folder, 'llama-server')),
+  ];
+  return candidates.some(existsSync) ? QWEN_START_SCRIPT : null;
 }
 
 /**
@@ -350,12 +343,12 @@ async function checkModel() {
     ok(`Something is already using port ${LLAMA_PORT}; assuming it is llama-server still loading`);
     return null;
   }
-  const llamaServer = LLAMA_AUTOSTART ? findLlamaServer() : null;
-  if (llamaServer) {
+  const qwenStartScript = LLAMA_AUTOSTART ? findQwenStartScript() : null;
+  if (qwenStartScript) {
     ok(IS_WINDOWS
-      ? `Qwen startup script found; it will run in a new PowerShell window (${llamaServer})`
-      : `llama.cpp found; the AI model will start with the app (${LLAMA_MODEL_FILE || 'Qwen3 4B'})`);
-    return llamaServer;
+      ? `Qwen startup script found; it will run in a new PowerShell window (${qwenStartScript})`
+      : `Qwen startup script found; it will run after chmod +x (${qwenStartScript})`);
+    return qwenStartScript;
   }
   const models = await ollamaModels();
   const qwen = (models || []).filter((name) => name.toLowerCase().startsWith('qwen'));
@@ -369,10 +362,8 @@ async function checkModel() {
     hint('  ollama pull qwen3:4b');
     return null;
   }
-  warn(IS_WINDOWS
-    ? `Qwen startup script was not found at ${QWEN_START_SCRIPT}, so "Run" (English ${SYMBOLS.arrow} C) will not work yet.`
-    : 'llama.cpp was not found, so "Run" (English ' + SYMBOLS.arrow + ' C) will not work yet.');
-  hint(IS_WINDOWS ? `Create or install the startup script at ${QWEN_START_SCRIPT}, then run npm run dev again.` : 'Install llama.cpp (see the README), then close and reopen VS Code.');
+  warn(`Qwen startup script was not found at ${QWEN_START_SCRIPT}, so "Run" (English ${SYMBOLS.arrow} C) will not work yet.`);
+  hint(`Make sure ${QWEN_START_SCRIPT} exists, then run npm run dev again.`);
   hint('Compile & Run works without it.');
   return null;
 }
@@ -428,14 +419,6 @@ function start(name, command, args, options) {
   return child;
 }
 
-function lastLines(file, count) {
-  try {
-    return readFileSync(file, 'utf8').split(/\r?\n/).filter((l) => l.trim()).slice(-count);
-  } catch {
-    return [];
-  }
-}
-
 function isProcessRunning(pid) {
   try {
     process.kill(pid, 0);
@@ -446,18 +429,18 @@ function isProcessRunning(pid) {
   }
 }
 
-/** Start the model server, in a separate PowerShell window on Windows. */
-function startLlamaServer(llamaServer) {
+/** Start the model using the platform's Qwen script. */
+function startQwenModel(startScript) {
   let ended = false;
 
   if (IS_WINDOWS) {
-    step(`Opening a PowerShell window to run ${llamaServer}`);
+    step(`Opening a PowerShell window to run ${startScript}`);
     const result = spawnSync(
       'powershell.exe',
       [
         '-NoProfile',
         '-Command',
-        `$window = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoExit -ExecutionPolicy Bypass -File "${llamaServer}"' -PassThru; $window.Id`,
+        `$window = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoExit -ExecutionPolicy Bypass -File "${startScript}"' -PassThru; $window.Id`,
       ],
       { encoding: 'utf8', windowsHide: true }
     );
@@ -474,29 +457,37 @@ function startLlamaServer(llamaServer) {
     modelWindowPid = pid;
     ok(`Qwen PowerShell window started (PID ${pid})`);
   } else {
-    step(`Starting the AI model (llama-server on port ${LLAMA_PORT})`);
-    if (!LLAMA_MODEL_FILE) {
-      hint('The first time, this downloads the Qwen3 4B model (about 2.5 GB).');
+    step(`Making ${startScript} executable`);
+    const chmod = spawnSync('chmod', ['+x', startScript], { encoding: 'utf8' });
+    if (chmod.error || chmod.status !== 0) {
+      ended = true;
+      const details = chmod.error
+        ? chmod.error.message
+        : (chmod.stderr && chmod.stderr.trim()) || `chmod exited with code ${chmod.status}`;
+      warn(`Could not make the Qwen startup script executable: ${details}`);
+      return;
     }
-    hint('The app opens straight away; a line appears here when the model is ready.');
-    hint(`llama-server's own messages go to ${path.relative(ROOT, LLAMA_LOG)}`);
-
-    const log = openSync(LLAMA_LOG, 'w');
-    const child = spawn(llamaServer, LLAMA_ARGS, { stdio: ['ignore', log, log], windowsHide: true });
-    closeSync(log);
+    ok('Qwen startup script is executable');
+    step(`Starting the AI model with ${startScript}`);
+    const child = spawn(startScript, [], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        LLAMA_DIR: process.env.LLAMA_DIR || backendEnv.LLAMA_DIR || '',
+        LLAMA_HF_MODEL,
+        LLAMA_MODEL_FILE,
+        LLAMA_PORT: String(LLAMA_PORT),
+        LLAMA_SERVER: process.env.LLAMA_SERVER || backendEnv.LLAMA_SERVER || '',
+      },
+      stdio: 'inherit',
+      windowsHide: true,
+    });
     children.push(child);
 
     const report = (why) => {
       if (ended || stopping) return;
       ended = true;
-      console.log(`\n  ${red(SYMBOLS.fail)} The AI model server ${why}. "Run" will not work; Compile & Run still does.`);
-      const tail = lastLines(LLAMA_LOG, 8);
-      if (tail.length) {
-        hint(`Last lines of ${path.relative(ROOT, LLAMA_LOG)}:`);
-        for (const line of tail) hint(`  ${line}`);
-      }
-      hint(`To try it by hand, run in another terminal:  ${LLAMA_COMMAND_TEXT}`);
-      console.log('');
+      warn(`The Qwen startup script ${why}; "Run" will not work. Check its output above. Compile & Run still works.`);
     };
     child.on('error', (error) => report(`could not start (${error.message})`));
     child.on('exit', (code) => report(`stopped (exit code ${code})`));
@@ -619,7 +610,7 @@ async function testModel() {
       ? `the model refused the adder example: ${code.trim()}`
       : (result.body && result.body.error) || `unexpected answer (HTTP ${result.status})`;
   console.log(`\n  ${yellow('!')} AI model test failed (${server}): ${what}`);
-  hint('"Run" may not work properly. Check llama-server.log, and that the model is Qwen3 4B.\n');
+  hint('"Run" may not work properly. Check the Qwen startup output above, and confirm the model is Qwen3 4B.\n');
 }
 
 async function main() {
@@ -630,13 +621,13 @@ async function main() {
   setupPython();
   setupFrontend();
   await checkGcc();
-  const llamaServer = await checkModel();
+  const qwenStartScript = await checkModel();
   await checkPorts();
 
   process.on('SIGINT', () => stopAll(0));
   process.on('SIGTERM', () => stopAll(0));
 
-  if (llamaServer) startLlamaServer(llamaServer);
+  if (qwenStartScript) startQwenModel(qwenStartScript);
 
   step(`Starting the backend on port ${BACKEND_PORT}`);
   start('backend', VENV_PYTHON, [BACKEND_MAIN], {

@@ -103,23 +103,12 @@ git pull origin backend
 `git branch --show-current` should print `backend`. If `npm run dev` says
 **Missing script: "dev"**, you are still on the old `main` branch.
 
-### Copy `start-qwen.ps1` to `C:\llama.cpp\` (Windows)
-
-From inside the `natural-language-compiler` folder, copy the start script
-next to llama.cpp:
-
-```powershell
-Copy-Item .\start-qwen.ps1 C:\llama.cpp\
-```
-
-Check that `C:\llama.cpp\start-qwen.ps1` now exists:
-
-```powershell
-Test-Path C:\llama.cpp\start-qwen.ps1
-```
-
-It should print `True`. Repeat this copy whenever `start-qwen.ps1` changes
-in the project (for example after `git pull`).
+The model startup scripts are in `scripts/`. Windows uses
+`scripts\start-qwen.ps1` with llama.cpp installed at `C:\llama.cpp\`; macOS
+and Linux use `scripts/start-qwen.sh`, which looks for llama.cpp in
+`~/llama.cpp` or on your PATH. The shell script also supports Git Bash on
+Windows and finds `C:\llama.cpp` automatically. Set `LLAMA_DIR` to use a
+different install folder.
 
 ## 3. Run it
 
@@ -155,12 +144,21 @@ To stop everything, press **Ctrl+C** in that terminal.
   llama-server -hf Qwen/Qwen3-4B-GGUF:Q4_K_M --port 8080 -c 8192 -np 1 --jinja
   ```
 
-- **With `start-qwen.ps1` (Windows):** after copying it to `C:\llama.cpp\`
-  (step 2), you can start the model server from it in another terminal
-  before `npm run dev`:
+- **With `scripts/start-qwen.sh` (macOS/Linux):** `npm run dev` makes the
+  script executable with `chmod +x` before running it. To start it yourself,
+  make it executable first, then run it:
+
+  ```bash
+  chmod +x scripts/start-qwen.sh
+  ./scripts/start-qwen.sh
+  ```
+
+- **With `scripts\start-qwen.ps1` (Windows):** `npm run dev` opens a separate
+  PowerShell window and runs this script automatically. To start it yourself
+  before `npm run dev`, run:
 
   ```powershell
-  C:\llama.cpp\start-qwen.ps1
+  .\scripts\start-qwen.ps1
   ```
 
   If PowerShell refuses to run it, allow scripts once with
@@ -196,13 +194,14 @@ The chip in the top-right corner shows what is working:
 | `Python 3.11 or newer was not found` | Install Python (step 1), then close and reopen VS Code |
 | `gcc (the C compiler) was not found` | Run the MSYS2 lines from step 1, then restart `npm run dev` |
 | `Missing script: "dev"` | You are on the old `main` branch: see "Already have an older copy?" in step 2 |
-| `The AI model is not running` | Wait for "The AI model is ready" in the `npm run dev` terminal. If it says the model stopped, see `llama-server.log` |
+| `The AI model is not running` | Wait for "The AI model is ready" in the `npm run dev` terminal. If the startup script reports an error, check the model installation path and its output |
 | `The AI model is still loading` | Wait for "The AI model is ready" in the terminal, then press **Run** again |
-| `AI model test failed` in the terminal | The model is not answering properly: check `llama-server.log`, and that it is Qwen3 4B (the default) |
+| `AI model test failed` in the terminal | The model is not answering properly: check the Qwen startup output, and that it is Qwen3 4B (the default) |
 | `The answer was cut off` | You started llama-server yourself without `-np 1`: use the command under "Other ways to run the AI model" |
 | `Port 8000 is already in use` | The app is already running in another terminal; use that one or stop it with Ctrl+C |
 | `llama-server` is not recognized | Check that `C:\llama.cpp\llama-server.exe` exists, that `C:\llama.cpp` is on your PATH (step 1), then reopen VS Code. Or download a Windows build from [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) and extract it into `C:\llama.cpp` |
-| `start-qwen.ps1` not found in `C:\llama.cpp\` | Run the copy command from step 2 inside the `natural-language-compiler` folder |
+| `scripts\start-qwen.ps1` not found | Make sure the project copy includes `scripts\start-qwen.ps1` |
+| `scripts/start-qwen.sh` not found | Make sure the project copy includes `scripts/start-qwen.sh` |
 | **Run** is slow | Normal on a laptop CPU: generation can take 30–60 seconds |
 
 ## What is in this repository
@@ -212,7 +211,8 @@ The chip in the top-right corner shows what is working:
 | `frontend/` | React + Vite web UI. See [`frontend/README.md`](frontend/README.md) |
 | `backend/` | FastAPI service: talks to the model and compiles/runs C with gcc. See [`backend/README.md`](backend/README.md) |
 | `scripts/dev.mjs` | what `npm run dev` runs: sets up Python, starts the AI model, backend and frontend |
-| `start-qwen.ps1` | script to start the Qwen model server; copy it to `C:\llama.cpp\` (step 2) |
+| `scripts/start-qwen.ps1` | script to start Qwen using the llama.cpp install in `C:\llama.cpp\` |
+| `scripts/start-qwen.sh` | macOS/Linux script to start Qwen; made executable by `npm run dev` |
 | `requirements.txt` | the backend's Python packages |
 
 **Safety note:** the app compiles and runs the generated C on your computer,

@@ -31,13 +31,14 @@ Nothing needs configuring: every setting has a default. To change one, copy `bac
 
 ### 4. Start the model server
 
-`npm run dev` does this for you when llama.cpp is installed. To run it by hand, install [llama.cpp](https://github.com/ggml-org/llama.cpp) (on Windows: `winget install llama.cpp`), then run:
+`npm run dev` starts the model for you. On Windows, it opens a new PowerShell window and runs `scripts/start-qwen.ps1`. On macOS and Linux, it runs `scripts/start-qwen.sh` after first making it executable. To start the model manually on macOS or Linux, install [llama.cpp](https://github.com/ggml-org/llama.cpp), then run:
 
-```bash
-llama-server -hf Qwen/Qwen3-4B-GGUF:Q4_K_M --port 8080 -c 8192 -np 1 --jinja
+```sh
+chmod +x scripts/start-qwen.sh
+./scripts/start-qwen.sh
 ```
 
-The first run downloads the Qwen3-4B model (about 2.5 GB). `-c 8192` leaves room for the roughly 2,000-token prompt, `-np 1` gives that whole context to one request (newer builds otherwise split it, which cuts answers off), and `--jinja` uses Qwen3's own chat template, which keeps its "thinking" (needed for correct answers) out of the returned code. The backend talks to `http://127.0.0.1:8080/v1/chat/completions`.
+The script uses `~/llama.cpp` by default, or `LLAMA_DIR` if set, and can find a Homebrew-installed `llama-server` on your PATH. The first run downloads the Qwen3-4B model (about 2.5 GB). `-c 8192` leaves room for the roughly 2,000-token prompt, `-np 1` gives that whole context to one request (newer builds otherwise split it, which cuts answers off), and `--jinja` uses Qwen3's own chat template, which keeps its "thinking" (needed for correct answers) out of the returned code. The backend talks to `http://127.0.0.1:8080/v1/chat/completions`.
 
 ### 5. Start the backend
 
@@ -267,4 +268,3 @@ CORS currently allows requests from any origin. This configuration is intended f
 - Windows enforces fewer limits than Linux: there is no file-size limit, and a program runs for a moment before its memory, CPU and child-process limits apply.
 - The execution service is not a complete security sandbox. Additional OS-level isolation is required before running untrusted programs.
 - The current CORS configuration permits requests from any origin and is intended only for local development.
-
