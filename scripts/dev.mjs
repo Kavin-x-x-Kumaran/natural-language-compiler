@@ -40,6 +40,7 @@ const APP_URL = `http://localhost:${FRONTEND_PORT}`;
 // a .gguf file you already have instead of downloading this one.
 const LLAMA_HF_MODEL = 'Qwen/Qwen3-4B-GGUF:Q4_K_M';
 const LLAMA_MODEL_FILE = process.env.LLAMA_MODEL_FILE || backendEnv.LLAMA_MODEL_FILE || '';
+const QWEN_START_SCRIPT = 'C:\\llama.cpp\\start-qwen.ps1';
 const LLAMA_AUTOSTART = !/^(0|false|no|off)$/i.test(
   process.env.LLAMA_AUTOSTART || backendEnv.LLAMA_AUTOSTART || 'true'
 );
@@ -323,14 +324,12 @@ function ollamaModels() {
 
 /** Full path of llama-server if llama.cpp is installed, else null. */
 function findLlamaServer() {
+  if (IS_WINDOWS) return existsSync(QWEN_START_SCRIPT) ? QWEN_START_SCRIPT : null;
+
   const explicit = process.env.LLAMA_SERVER || backendEnv.LLAMA_SERVER;
   if (explicit) return existsSync(explicit) ? explicit : null;
-  const name = IS_WINDOWS ? 'llama-server.exe' : 'llama-server';
+  const name = 'llama-server';
   const folders = (process.env.PATH || process.env.Path || '').split(path.delimiter).filter(Boolean);
-  if (IS_WINDOWS && process.env.LOCALAPPDATA) {
-    // winget's shortcut folder, in case PATH has not been refreshed yet.
-    folders.push(path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links'));
-  }
   for (const folder of folders) {
     const candidate = path.join(folder.replace(/^"|"$/g, ''), name);
     if (existsSync(candidate)) return candidate;
@@ -353,7 +352,9 @@ async function checkModel() {
   }
   const llamaServer = LLAMA_AUTOSTART ? findLlamaServer() : null;
   if (llamaServer) {
-    ok(`llama.cpp found; the AI model will start with the app (${LLAMA_MODEL_FILE || 'Qwen3 4B'})`);
+    ok(IS_WINDOWS
+      ? `Qwen startup script found; it will run in a new PowerShell window (${llamaServer})`
+      : `llama.cpp found; the AI model will start with the app (${LLAMA_MODEL_FILE || 'Qwen3 4B'})`);
     return llamaServer;
   }
   const models = await ollamaModels();
@@ -368,9 +369,10 @@ async function checkModel() {
     hint('  ollama pull qwen3:4b');
     return null;
   }
-  warn('llama.cpp was not found, so "Run" (English ' + SYMBOLS.arrow + ' C) will not work yet.');
-  hint(IS_WINDOWS ? 'Install it with:  winget install llama.cpp' : 'Install llama.cpp (see the README).');
-  hint('Then close and reopen VS Code, and run: npm run dev');
+  warn(IS_WINDOWS
+    ? `Qwen startup script was not found at ${QWEN_START_SCRIPT}, so "Run" (English ${SYMBOLS.arrow} C) will not work yet.`
+    : 'llama.cpp was not found, so "Run" (English ' + SYMBOLS.arrow + ' C) will not work yet.');
+  hint(IS_WINDOWS ? `Create or install the startup script at ${QWEN_START_SCRIPT}, then run npm run dev again.` : 'Install llama.cpp (see the README), then close and reopen VS Code.');
   hint('Compile & Run works without it.');
   return null;
 }
@@ -390,10 +392,15 @@ async function checkPorts() {
 
 const children = [];
 let stopping = false;
+let modelWindowPid = null;
 
 function stopAll(exitCode = 0) {
   if (stopping) return;
   stopping = true;
+  if (IS_WINDOWS && modelWindowPid !== null) {
+    spawnSync('taskkill', ['/pid', String(modelWindowPid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    modelWindowPid = null;
+  }
   for (const child of children) {
     if (child.exitCode !== null || child.signalCode !== null) continue;
     if (IS_WINDOWS) {
@@ -429,51 +436,95 @@ function lastLines(file, count) {
   }
 }
 
-/** Start llama-server in the background; its (long) output goes to a log file. */
-function startLlamaServer(llamaServer) {
-  step(`Starting the AI model (llama-server on port ${LLAMA_PORT})`);
-  if (!LLAMA_MODEL_FILE) {
-    hint('The first time, this downloads the Qwen3 4B model (about 2.5 GB).');
+function isProcessRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === 'ESRCH') return false;
+    throw error;
   }
-  hint('The app opens straight away; a line appears here when the model is ready.');
-  hint(`llama-server's own messages go to ${path.relative(ROOT, LLAMA_LOG)}`);
+}
 
-  const log = openSync(LLAMA_LOG, 'w');
-  const child = spawn(llamaServer, LLAMA_ARGS, { stdio: ['ignore', log, log], windowsHide: true });
-  closeSync(log);
-  children.push(child);
-
+/** Start the model server, in a separate PowerShell window on Windows. */
+function startLlamaServer(llamaServer) {
   let ended = false;
-  const report = (why) => {
-    if (ended || stopping) return;
-    ended = true;
-    console.log(`\n  ${red(SYMBOLS.fail)} The AI model server ${why}. "Run" will not work; Compile & Run still does.`);
-    const tail = lastLines(LLAMA_LOG, 8);
-    if (tail.length) {
-      hint(`Last lines of ${path.relative(ROOT, LLAMA_LOG)}:`);
-      for (const line of tail) hint(`  ${line}`);
+
+  if (IS_WINDOWS) {
+    step(`Opening a PowerShell window to run ${llamaServer}`);
+    const result = spawnSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-Command',
+        `$window = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoExit -ExecutionPolicy Bypass -File "${llamaServer}"' -PassThru; $window.Id`,
+      ],
+      { encoding: 'utf8', windowsHide: true }
+    );
+    const pidText = result.stdout ? result.stdout.trim() : '';
+    const pid = Number(pidText);
+    if (result.error || result.status !== 0 || !Number.isInteger(pid) || pid <= 0) {
+      ended = true;
+      const details = result.error
+        ? result.error.message
+        : (result.stderr && result.stderr.trim()) || `PowerShell exited with code ${result.status} without returning a process ID`;
+      warn(`Could not open the Qwen PowerShell window: ${details}`);
+      return;
     }
-    hint(`To try it by hand, run in another terminal:  ${LLAMA_COMMAND_TEXT}`);
-    console.log('');
-  };
-  child.on('error', (error) => report(`could not start (${error.message})`));
-  child.on('exit', (code) => report(`stopped (exit code ${code})`));
+    modelWindowPid = pid;
+    ok(`Qwen PowerShell window started (PID ${pid})`);
+  } else {
+    step(`Starting the AI model (llama-server on port ${LLAMA_PORT})`);
+    if (!LLAMA_MODEL_FILE) {
+      hint('The first time, this downloads the Qwen3 4B model (about 2.5 GB).');
+    }
+    hint('The app opens straight away; a line appears here when the model is ready.');
+    hint(`llama-server's own messages go to ${path.relative(ROOT, LLAMA_LOG)}`);
+
+    const log = openSync(LLAMA_LOG, 'w');
+    const child = spawn(llamaServer, LLAMA_ARGS, { stdio: ['ignore', log, log], windowsHide: true });
+    closeSync(log);
+    children.push(child);
+
+    const report = (why) => {
+      if (ended || stopping) return;
+      ended = true;
+      console.log(`\n  ${red(SYMBOLS.fail)} The AI model server ${why}. "Run" will not work; Compile & Run still does.`);
+      const tail = lastLines(LLAMA_LOG, 8);
+      if (tail.length) {
+        hint(`Last lines of ${path.relative(ROOT, LLAMA_LOG)}:`);
+        for (const line of tail) hint(`  ${line}`);
+      }
+      hint(`To try it by hand, run in another terminal:  ${LLAMA_COMMAND_TEXT}`);
+      console.log('');
+    };
+    child.on('error', (error) => report(`could not start (${error.message})`));
+    child.on('exit', (code) => report(`stopped (exit code ${code})`));
+  }
 
   // Tell the user when the model is ready, and that it is still working.
   (async () => {
     const started = Date.now();
     let lastNote = started;
+    let readyReported = false;
     while (!ended && !stopping) {
-      if (await isUp(`http://127.0.0.1:${LLAMA_PORT}/health`, 3000)) {
+      if (IS_WINDOWS && modelWindowPid !== null && !isProcessRunning(modelWindowPid)) {
+        ended = true;
+        if (!stopping) warn('The Qwen PowerShell window exited; "Run" may not work.');
+        return;
+      }
+      if (!readyReported && await isUp(`http://127.0.0.1:${LLAMA_PORT}/health`, 3000)) {
         if (!stopping) {
           console.log(`\n  ${green(SYMBOLS.ok)} ${bold('The AI model is ready.')} Press "Run" in the browser.\n`);
         }
-        return;
+        readyReported = true;
       }
-      if (Date.now() - lastNote >= 60000) {
+      if (!readyReported && Date.now() - lastNote >= 60000) {
         lastNote = Date.now();
         const minutes = Math.round((lastNote - started) / 60000);
-        hint(`... the AI model is still loading (${minutes} min so far; the first start downloads 2.5 GB)`);
+        hint(IS_WINDOWS
+          ? `... the AI model is still loading (${minutes} min so far; see the PowerShell window)`
+          : `... the AI model is still loading (${minutes} min so far; the first start downloads 2.5 GB)`);
       }
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
