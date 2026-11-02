@@ -23,7 +23,6 @@ minute or two; say **Yes** if Windows asks for permission):
 winget install OpenJS.NodeJS.LTS
 winget install Python.Python.3.12
 winget install Git.Git
-winget install llama.cpp
 winget install MSYS2.MSYS2
 C:\msys64\usr\bin\bash.exe -lc "pacman -Sy --noconfirm mingw-w64-ucrt-x86_64-gcc"
 ```
@@ -33,8 +32,37 @@ C:\msys64\usr\bin\bash.exe -lc "pacman -Sy --noconfirm mingw-w64-ucrt-x86_64-gcc
 | **Node.js** (LTS) | runs `npm run dev` and the web page |
 | **Python** 3.11 or newer | runs the backend |
 | **Git** | downloads the project |
-| **llama.cpp** | runs the AI model (Qwen3 4B) |
+| **llama.cpp** | runs the AI model (Qwen3 4B). Installed manually into `C:\llama.cpp\` (see below) |
 | **MSYS2** + the last line | installs **gcc**, which compiles the C code. The app finds it in `C:\msys64` by itself |
+
+### Download llama.cpp into `C:\llama.cpp\` (Windows)
+
+llama.cpp goes in the **root of your C: drive**, in a folder called `llama.cpp`.
+
+1. Go to the [llama.cpp releases page](https://github.com/ggml-org/llama.cpp/releases)
+   and download the latest Windows zip for your computer under **Assets**
+   (for most computers: the file named like `llama-bXXXX-bin-win-cpu-x64.zip`;
+   if you have an NVIDIA graphics card you can use the `cuda` build instead).
+2. Create the folder `C:\llama.cpp`:
+
+   ```powershell
+   New-Item -ItemType Directory -Force C:\llama.cpp
+   ```
+
+3. Extract the zip **into** `C:\llama.cpp` so that `llama-server.exe` is directly
+   inside it (not in a sub-folder):
+
+   ```powershell
+   Expand-Archive -Path "$HOME\Downloads\llama-*-bin-win-*.zip" -DestinationPath C:\llama.cpp -Force
+   ```
+
+   (Adjust the file name if you saved the zip somewhere else.)
+4. Add the folder to your PATH, so the app and your terminal can find
+   `llama-server`:
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\llama.cpp", "User")
+   ```
 
 Then **close and reopen PowerShell / VS Code** so it sees the new programs,
 and check:
@@ -47,7 +75,8 @@ llama-server --version
 ```
 
 Each should print a version number. If one says "not recognized", install it
-again or restart the computer.
+again or restart the computer. (If only `llama-server` fails, check that
+`C:\llama.cpp\llama-server.exe` exists and that step 4 above was done.)
 
 **Linux / macOS:** install the same programs with your package manager:
 `brew install node python git llama.cpp` on macOS (gcc comes with
@@ -73,6 +102,24 @@ git pull origin backend
 
 `git branch --show-current` should print `backend`. If `npm run dev` says
 **Missing script: "dev"**, you are still on the old `main` branch.
+
+### Copy `start-qwen.ps1` to `C:\llama.cpp\` (Windows)
+
+From inside the `natural-language-compiler` folder, copy the start script
+next to llama.cpp:
+
+```powershell
+Copy-Item .\start-qwen.ps1 C:\llama.cpp\
+```
+
+Check that `C:\llama.cpp\start-qwen.ps1` now exists:
+
+```powershell
+Test-Path C:\llama.cpp\start-qwen.ps1
+```
+
+It should print `True`. Repeat this copy whenever `start-qwen.ps1` changes
+in the project (for example after `git pull`).
 
 ## 3. Run it
 
@@ -108,6 +155,17 @@ To stop everything, press **Ctrl+C** in that terminal.
   llama-server -hf Qwen/Qwen3-4B-GGUF:Q4_K_M --port 8080 -c 8192 -np 1 --jinja
   ```
 
+- **With `start-qwen.ps1` (Windows):** after copying it to `C:\llama.cpp\`
+  (step 2), you can start the model server from it in another terminal
+  before `npm run dev`:
+
+  ```powershell
+  C:\llama.cpp\start-qwen.ps1
+  ```
+
+  If PowerShell refuses to run it, allow scripts once with
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
 - **[Ollama](https://ollama.com):** if llama.cpp is not installed but Ollama
   has a Qwen model (`ollama list`), the app uses Ollama instead (it prefers
   `qwen3:4b`).
@@ -127,7 +185,7 @@ The chip in the top-right corner shows what is working:
 | chip | meaning |
 | --- | --- |
 | **Ready** (green) | everything is running |
-| **AI model not running** (amber) | Compile & Run works. **Run** needs the AI model: wait for "The AI model is ready" in the terminal, or install llama.cpp (step 1) |
+| **AI model not running** (amber) | Compile & Run works. **Run** needs the AI model: wait for "The AI model is ready" in the terminal, or install llama.cpp into `C:\llama.cpp\` (step 1) |
 | **Backend not running** (red) | start the app with `npm run dev` |
 
 ## Troubleshooting
@@ -143,7 +201,8 @@ The chip in the top-right corner shows what is working:
 | `AI model test failed` in the terminal | The model is not answering properly: check `llama-server.log`, and that it is Qwen3 4B (the default) |
 | `The answer was cut off` | You started llama-server yourself without `-np 1`: use the command under "Other ways to run the AI model" |
 | `Port 8000 is already in use` | The app is already running in another terminal; use that one or stop it with Ctrl+C |
-| `llama-server` is not recognized | Reopen VS Code after `winget install`, or download a Windows build from [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) |
+| `llama-server` is not recognized | Check that `C:\llama.cpp\llama-server.exe` exists, that `C:\llama.cpp` is on your PATH (step 1), then reopen VS Code. Or download a Windows build from [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) and extract it into `C:\llama.cpp` |
+| `start-qwen.ps1` not found in `C:\llama.cpp\` | Run the copy command from step 2 inside the `natural-language-compiler` folder |
 | **Run** is slow | Normal on a laptop CPU: generation can take 30–60 seconds |
 
 ## What is in this repository
@@ -153,6 +212,7 @@ The chip in the top-right corner shows what is working:
 | `frontend/` | React + Vite web UI. See [`frontend/README.md`](frontend/README.md) |
 | `backend/` | FastAPI service: talks to the model and compiles/runs C with gcc. See [`backend/README.md`](backend/README.md) |
 | `scripts/dev.mjs` | what `npm run dev` runs: sets up Python, starts the AI model, backend and frontend |
+| `start-qwen.ps1` | script to start the Qwen model server; copy it to `C:\llama.cpp\` (step 2) |
 | `requirements.txt` | the backend's Python packages |
 
 **Safety note:** the app compiles and runs the generated C on your computer,
